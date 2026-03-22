@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Slurm / 集群
+slurm-*.out
+*.err
+
+# 系统/编辑器
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
+
+# 大文件 / 模型 / 数据（不上传到 GitHub）
+checkpoints/
+data/
+pretrained_models/
+Merged_data/
+log/
+tmux-slurm/
+
+# 大文件通用规则
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.h5
+*.hdf5
+*.tar.gz
+*.zip
+*.tar
