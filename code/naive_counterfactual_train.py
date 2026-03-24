@@ -20,6 +20,7 @@ from train_logging import (
     create_run_paths,
     setup_train_logging,
     log_run_header,
+    log_config_snapshot,
     format_epoch_line,
     format_final_results_lines,
     log_final_results_block,
@@ -389,18 +390,24 @@ if __name__ == "__main__":
             "target": args.target,
         },
     )
-    _logger.info("Config dict: %s", {k: v for k, v in config.items() if k != "logger"})
+    log_config_snapshot(_logger, config)
 
     trainModel(model, train_dataloader, valid_dataloader, config)
     model.load_state_dict(torch.load(config.get("save_file")))
 
     # use valid or test.
+    import time as _time
+    _eval_t0 = _time.time()
+    _eval_start_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     final = evalModel(model, valid_dataloader, config.get("device"))
+    _eval_elapsed = _time.time() - _eval_t0
+    _eval_min, _eval_sec = divmod(int(_eval_elapsed), 60)
     _td = (
         f"朴素反事实训练 naive_counterfactual_train Task {task_idx}: "
         f"{args.auxiliary} -> {args.target}"
     )
-    _lines = format_final_results_lines(final, task_description=_td)
+    _lines = format_final_results_lines(final, task_description=_td, start_time=_eval_start_str)
+    _lines.append(f"Eval elapsed: {_eval_min}m {_eval_sec}s ({_eval_elapsed:.1f}s)")
     log_final_results_block(_logger, _lines)
     finalize_run_log(_logger)
     append_eval_run_summaries(
@@ -413,5 +420,7 @@ if __name__ == "__main__":
         log_file=log_path,
         save_file=config.get("save_file"),
         task_description=_td,
+        start_time=_eval_start_str,
+        eval_elapsed=_eval_elapsed,
     )
     _logger.info("DONE.")

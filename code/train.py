@@ -21,7 +21,9 @@ from train_logging import (
     create_run_paths,
     setup_train_logging,
     log_run_header,
-    format_epoch_line,
+    log_config_snapshot,
+    format_epoch_training_block,
+    log_epoch_training_block,
     format_final_results_lines,
     log_final_results_block,
     finalize_run_log,
@@ -274,16 +276,27 @@ def trainModel(model, train_dataloader, valid_dataloader, config):
                 avg_loss += loss.item()
             avg_loss /= len(train_dataloader)
             lr_epoch = optimizer.param_groups[0]["lr"]
-            perf.epoch_end(epoch + 1, len(train_dataloader))
+            rec = perf.epoch_end(epoch + 1, len(train_dataloader), emit_log=False)
             current_valid_loss = validModel(model, valid_dataloader, device)
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            line = format_epoch_line(
-                epoch + 1, current_time, lr_epoch, avg_loss, current_valid_loss,
+            block = format_epoch_training_block(
+                time_str=current_time,
+                epoch=epoch + 1,
+                epoch_time_s=rec["epoch_time"],
+                total_time_s=rec["total_time"],
+                step_time_s=rec["step_time"],
+                gpu_util=rec["gpu_util"],
+                gpu_mem=rec["gpu_mem"],
+                cpu_used=rec["cpu_used"],
+                cpu_total=rec["cpu_total"],
+                cpu_util=rec["cpu_util"],
+                lr=lr_epoch,
+                train_loss=avg_loss,
+                valid_loss=current_valid_loss,
+                adv_loss=None,
+                bleu_line=None,
             )
-            if logger:
-                logger.info(line)
-            else:
-                print(line, flush=True)
+            log_epoch_training_block(logger, block)
             if current_valid_loss > prev_valid_loss:
                 learning_rate = learning_rate * 0.5
                 enduration += 1
@@ -482,13 +495,19 @@ if __name__ == "__main__":
             "target": config["target"],
         },
     )
-    _logger.info("Config dict: %s", {k: v for k, v in config.items() if k != "logger"})
+    log_config_snapshot(_logger, config)
 
     trainModel(model, train_dataloader, valid_dataloader, config)
     model.load_state_dict(torch.load(config.get("save_file")))
+    import time as _time
+    _eval_t0 = _time.time()
+    _eval_start_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     final = evalModel(model, test_dataloader, config.get("device"))
+    _eval_elapsed = _time.time() - _eval_t0
+    _eval_min, _eval_sec = divmod(int(_eval_elapsed), 60)
     _td = f"train.py 单卡 D4C Task {index}: {args.source} -> {args.target}"
-    _lines = format_final_results_lines(final, task_description=_td)
+    _lines = format_final_results_lines(final, task_description=_td, start_time=_eval_start_str)
+    _lines.append(f"Eval elapsed: {_eval_min}m {_eval_sec}s ({_eval_elapsed:.1f}s)")
     log_final_results_block(_logger, _lines)
     finalize_run_log(_logger)
     append_eval_run_summaries(
@@ -501,5 +520,7 @@ if __name__ == "__main__":
         log_file=log_path,
         save_file=config.get("save_file"),
         task_description=_td,
+        start_time=_eval_start_str,
+        eval_elapsed=_eval_elapsed,
     )
     _logger.info("DONE.")
