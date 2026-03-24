@@ -5,12 +5,17 @@
   D4C_LOG_DIR      日志目录（默认 <项目根>/logs）
   D4C_CONSOLE_LEVEL 控制台级别，默认 INFO（非 rank0 恒为 WARNING）
   D4C_FILE_LEVEL    文件级别，默认 DEBUG（仅 rank0 有 FileHandler）
+  D4C_LOG_CONSOLE=1 rank0 在写日志文件时仍向 stdout 镜像（默认关闭：仅 FileHandler 写文件，避免与 shell 重定向/tee 双写）
   D4C_MIRROR_LOG=1  同时镜像到 code/log.out（旧行为，默认关闭）
   D4C_LOG_PRETTY=0  关闭多行缩进 JSON（默认开启 RUN_META / RUN_CONFIG 多行缩进，便于阅读）
   D4C_LOG_STRUCTURED_CONSOLE=1  结构化块（RUN_*）同时打到控制台；默认仅写入日志文件，避免与 FileHandler
                                 并存且 stderr 被 tee/重定向到同一文件时出现重复行。
   D4C_EVAL_SUMMARY=0           关闭 eval 自动汇总（默认开启）：写入每任务与全局共 6 个文件（txt/jsonl/csv）。
-  D4C_EVAL_SUMMARY_GLOBAL_DIR  全局汇总目录（默认 <项目根>/log），内含 eval_runs_all.{txt,jsonl,csv}
+  D4C_EVAL_SUMMARY_GLOBAL_DIR  全局汇总目录（显式设置时优先，路径原样使用）。未设置时：优先按 D4C_LOG_GROUP
+                                为 <项目根>/log/<group>/eval；否则按 D4C_CHECKPOINT_GROUP；再否则按 SUBDIR 启发式
+                                （step3_/step5_ 前缀）；否则 <项目根>/log/eval。
+                                内含 eval_runs_all.{txt,jsonl,csv}
+  每任务 eval 汇总：get_log_task_dir(task) 下的 eval/ 子目录内 eval_runs.{txt,jsonl,csv}（训练主日志在 runs/ 子目录，由 shell 约定）
 """
 from __future__ import annotations
 
@@ -88,14 +93,29 @@ def _structured_console_enabled() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def _console_mirror_enabled() -> bool:
+    """rank0 写日志文件时是否仍附加 StreamHandler（默认 False，仅文件写入）。"""
+    v = os.environ.get("D4C_LOG_CONSOLE", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def logger_has_file_handler(logger: Optional[logging.Logger]) -> bool:
+    """用于判断当前是否由 FileHandler 写文件（避免 print 与 logging 双份）。"""
+    if logger is None:
+        return False
+    return any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+
+
 def _structured_log_extra(logger: logging.Logger) -> Dict[str, Any]:
     """
-    若存在 FileHandler 且未要求控制台镜像，则标记 d4c_file_only，由 StreamHandler 过滤器抑制，
-    避免 tee/2>&1 与文件为同一路径时大块 JSON 重复。
+    若同时存在 FileHandler 与 StreamHandler 且未要求结构化块上控制台，则标记 d4c_file_only，
+    由 StreamHandler 过滤器抑制，避免 tee/2>&1 与文件为同一路径时大块 JSON 重复。
     """
     if _structured_console_enabled():
         return {}
-    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+    has_file = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+    has_stream = any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+    if has_file and has_stream:
         return {"d4c_file_only": True}
     return {}
 
@@ -123,7 +143,8 @@ def setup_train_logging(
     file_level: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    配置名为 d4c 的 logger：控制台 INFO（rank0）/ WARNING（其他 rank）；文件仅 rank0。
+    配置名为 d4c 的 logger：rank0 默认仅 FileHandler 写文件（不重定向终端也可单份）；
+    设 D4C_LOG_CONSOLE=1 时 rank0 额外附加 StreamHandler；非 rank0 仅 StreamHandler（WARNING+）。
     """
     if run_id is None:
         run_id = generate_run_id()
@@ -137,17 +158,23 @@ def setup_train_logging(
 
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    if rank == 0:
-        sh.setLevel(console_level)
-    else:
-        sh.setLevel(logging.WARNING)
-    logger.addHandler(sh)
-
     log_path = log_file
+    mirror = _console_mirror_enabled()
+    # rank0 且有日志路径时默认不挂 StreamHandler，避免与 FileHandler 双写同一文件（含 shell 重定向）
+    want_stream = (rank != 0) or (not (rank == 0 and log_path)) or mirror
+
+    if want_stream:
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        if rank == 0:
+            sh.setLevel(console_level)
+        else:
+            sh.setLevel(logging.WARNING)
+        if rank == 0 and log_path:
+            sh.addFilter(_StreamSuppressFileOnlyFilter())
+        logger.addHandler(sh)
+
     if rank == 0 and log_path:
-        sh.addFilter(_StreamSuppressFileOnlyFilter())
         d = os.path.dirname(os.path.abspath(log_path))
         if d:
             os.makedirs(d, exist_ok=True)
@@ -229,16 +256,73 @@ def format_epoch_line(
     return " | ".join(parts)
 
 
+def _fmt_duration_sec(t: float) -> str:
+    if t >= 3600:
+        return f"{t/3600:.1f}h"
+    if t >= 60:
+        return f"{t/60:.1f}m"
+    return f"{t:.1f}s"
+
+
+def format_epoch_training_block(
+    *,
+    time_str: str,
+    epoch: int,
+    epoch_time_s: float,
+    total_time_s: float,
+    step_time_s: float,
+    gpu_util: str,
+    gpu_mem: str,
+    cpu_used: str,
+    cpu_total: str,
+    cpu_util: str,
+    lr: float,
+    train_loss: float,
+    valid_loss: Optional[float] = None,
+    adv_loss: Optional[float] = None,
+    bleu_line: Optional[str] = None,
+) -> str:
+    """每 epoch 一块多行纯文本（无 logging 时间戳/级别前缀），与 perf_monitor 的 rec 字段对齐。
+
+    第一行为 time_str，第二行为「Epoch n」，其后指标行统一缩进 4 空格；块末多一个空行与下一 epoch 分隔。
+    """
+    et = _fmt_duration_sec(epoch_time_s)
+    tt = _fmt_duration_sec(total_time_s)
+    step_ms = step_time_s * 1000
+    line3 = f"epoch_time={et}\t|\ttotal={tt}\t\t|\tstep={step_ms:.0f}ms |"
+    line4 = f"GPU={gpu_util}\t|\tMem={gpu_mem}\t|\tCPU={cpu_used}/{cpu_total} {cpu_util}"
+    parts5: List[str] = [f"lr={lr:.6g}", f"train_loss={train_loss:.4f}"]
+    if valid_loss is not None:
+        parts5.append(f"valid_loss={valid_loss:.4f}")
+    if adv_loss is not None:
+        parts5.append(f"adv_loss={adv_loss:.4f}")
+    line5 = "\t|\t".join(parts5)
+    detail = [line3, line4, line5]
+    if bleu_line is not None:
+        detail.append(bleu_line.rstrip())
+    indent = "    "
+    lines: List[str] = [time_str, f"Epoch {epoch}"] + [indent + ln for ln in detail]
+    # 块末空行：与下一 epoch 的时间戳分隔，便于阅读
+    return "\n".join(lines) + "\n\n"
+
+
+def log_epoch_training_block(logger: Optional[logging.Logger], text: str) -> None:
+    """写入 format_epoch_training_block 生成的多行块（文件 + rank0 控制台，无前缀）。"""
+    _write_plain_log_block(logger, text)
+
+
 def format_final_results_lines(
     final: Dict[str, Any],
     *,
     task_description: Optional[str] = None,
+    start_time: Optional[str] = None,
 ) -> List[str]:
     """构建 FINAL RESULTS 文本行（无 log 前缀；指标行用制表符缩进）。
 
     task_description: 可选，在评估结果块最上方增加一行「任务说明：…」（位于 FINAL RESULTS 分隔线之上）。
+    start_time: 可选，eval 开始时间字符串；未传则用当前时间。
     """
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    current_time = start_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     tab = "\t"
     lines: List[str] = []
     if task_description:
@@ -258,14 +342,15 @@ def format_final_results_lines(
             f"{tab}BLEU: {final['explanation']['bleu']['1']}, {final['explanation']['bleu']['2']}, {final['explanation']['bleu']['3']}, {final['explanation']['bleu']['4']} ",
             f"{tab}DIST: {final['explanation']['dist']['1']}, {final['explanation']['dist']['2']},",
             f"{tab}METEOR: {final['explanation']['meteor']} ",
-            f"{tab}BERT: {final['explanation']['bert']} ",
         ]
     )
+    if "bert" in final.get("explanation", {}):
+        lines.append(f"{tab}BERT: {final['explanation']['bert']} ")
     return lines
 
 
 def _write_plain_log_block(logger: Optional[logging.Logger], text: str) -> None:
-    """写入多行纯文本（不经 Formatter），同步到 FileHandler 与控制台 StreamHandler。"""
+    """写入多行纯文本（不经 Formatter）：对每个 Handler 各写一次（通常仅 FileHandler，无控制台镜像）。"""
     if not text.endswith("\n"):
         text = text + "\n"
     if logger is None:
@@ -287,7 +372,7 @@ def _write_plain_log_block(logger: Optional[logging.Logger], text: str) -> None:
 
 
 def log_final_results_block(logger: Optional[logging.Logger], lines: list) -> None:
-    """FINAL RESULTS 多行块（纯文本，无时间戳/级别前缀；写入文件 + rank0 控制台）。"""
+    """FINAL RESULTS 多行块（纯文本，无时间戳/级别前缀；默认仅文件，D4C_LOG_CONSOLE=1 时兼写控制台）。"""
     text = "\n".join(lines)
     _write_plain_log_block(logger, text)
 
@@ -318,6 +403,8 @@ def broadcast_run_paths_ddp(
 
 # --- eval 结果自动汇总（每任务 + 全局，纯文本 / JSONL / CSV）---
 
+_EVAL_SUMMARY_SUBDIR = "eval"  # 与 runs/…/train.log 分层：…/<group>/eval/eval_runs.*
+
 _EVAL_SUMMARY_TXT = "eval_runs.txt"
 _EVAL_SUMMARY_JSONL = "eval_runs.jsonl"
 _EVAL_SUMMARY_CSV = "eval_runs.csv"
@@ -347,7 +434,7 @@ _EVAL_SUMMARY_CSV_FIELDS: Tuple[str, ...] = (
     "dist_1",
     "dist_2",
     "meteor",
-    "bert",
+    "eval_elapsed_s",
 )
 
 
@@ -362,7 +449,18 @@ def _global_eval_summary_dir() -> str:
     g = os.environ.get("D4C_EVAL_SUMMARY_GLOBAL_DIR", "").strip()
     if g:
         return os.path.abspath(os.path.expanduser(g))
-    return os.path.join(D4C_ROOT, "log")
+    log_group = os.environ.get("D4C_LOG_GROUP", "").strip().lower()
+    if log_group in ("step3", "step5"):
+        return os.path.join(D4C_ROOT, "log", log_group, _EVAL_SUMMARY_SUBDIR)
+    group = os.environ.get("D4C_CHECKPOINT_GROUP", "").strip().lower()
+    if group in ("step3", "step5"):
+        return os.path.join(D4C_ROOT, "log", group, _EVAL_SUMMARY_SUBDIR)
+    sub = os.environ.get("D4C_CHECKPOINT_SUBDIR", "").strip().lower()
+    if sub.startswith("step3_"):
+        return os.path.join(D4C_ROOT, "log", "step3", _EVAL_SUMMARY_SUBDIR)
+    if sub.startswith("step5_"):
+        return os.path.join(D4C_ROOT, "log", "step5", _EVAL_SUMMARY_SUBDIR)
+    return os.path.join(D4C_ROOT, "log", _EVAL_SUMMARY_SUBDIR)
 
 
 def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, float]:
@@ -378,7 +476,7 @@ def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, float]
             return float(x.item())
         return float(x)
 
-    return {
+    d = {
         "mae": _f(r["mae"]),
         "rmse": _f(r["rmse"]),
         "rouge_1": _f(rg["1"]),
@@ -391,8 +489,10 @@ def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, float]
         "dist_1": _f(di["1"]),
         "dist_2": _f(di["2"]),
         "meteor": _f(e["meteor"]),
-        "bert": _f(e["bert"]),
     }
+    if "bert" in e:
+        d["bert"] = _f(e["bert"])
+    return d
 
 
 def _append_text(path: str, text: str) -> None:
@@ -433,11 +533,14 @@ def append_eval_run_summaries(
     log_file: Optional[str] = None,
     save_file: Optional[str] = None,
     task_description: Optional[str] = None,
+    start_time: Optional[str] = None,
+    eval_elapsed: Optional[float] = None,
 ) -> None:
     """将一次 eval 的指标追加到每任务目录与全局目录下的 .txt / .jsonl / .csv（共 6 个文件）。
 
-    每任务：get_log_task_dir(task_idx) 下 eval_runs.{txt,jsonl,csv}
-    全局：D4C_EVAL_SUMMARY_GLOBAL_DIR（默认 <项目根>/log）下 eval_runs_all.{txt,jsonl,csv}
+    每任务：get_log_task_dir(task_idx)/eval/ 下 eval_runs.{txt,jsonl,csv}（如 log/<task>/step3/eval/、log/<task>/step5/eval/）
+    全局：D4C_EVAL_SUMMARY_GLOBAL_DIR（显式路径不自动加子目录），否则为 log/step3/eval、log/step5/eval
+          或 log/eval 下 eval_runs_all.{txt,jsonl,csv}
 
     设 D4C_EVAL_SUMMARY=0 可关闭。失败时静默忽略，不影响主训练/评估流程。
     """
@@ -448,7 +551,7 @@ def append_eval_run_summaries(
     except Exception:
         return
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = start_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     desc_one_line = (task_description or "").replace("\n", " ").strip()
     row: Dict[str, Any] = {
         "ts": ts,
@@ -461,9 +564,13 @@ def append_eval_run_summaries(
         "save_file": os.path.abspath(os.path.expanduser(save_file)) if save_file else "",
         "task_description": desc_one_line,
         **metrics,
+        "eval_elapsed_s": round(eval_elapsed, 1) if eval_elapsed is not None else "",
     }
 
-    lines_block = format_final_results_lines(final, task_description=task_description)
+    lines_block = format_final_results_lines(final, task_description=task_description, start_time=start_time)
+    if eval_elapsed is not None:
+        _m, _s = divmod(int(eval_elapsed), 60)
+        lines_block.append(f"Eval elapsed: {_m}m {_s}s ({eval_elapsed:.1f}s)")
     plain_sep = (
         "================================================================================\n"
         f"{ts} | run_id={run_id} | task_idx={task_idx} | pipeline={pipeline}\n"
@@ -476,10 +583,10 @@ def append_eval_run_summaries(
     )
 
     try:
-        task_dir = get_log_task_dir(task_idx)
-        _append_text(os.path.join(task_dir, _EVAL_SUMMARY_TXT), plain_sep)
-        _append_jsonl(os.path.join(task_dir, _EVAL_SUMMARY_JSONL), row)
-        _append_csv_row(os.path.join(task_dir, _EVAL_SUMMARY_CSV), row)
+        task_eval_dir = os.path.join(get_log_task_dir(task_idx), _EVAL_SUMMARY_SUBDIR)
+        _append_text(os.path.join(task_eval_dir, _EVAL_SUMMARY_TXT), plain_sep)
+        _append_jsonl(os.path.join(task_eval_dir, _EVAL_SUMMARY_JSONL), row)
+        _append_csv_row(os.path.join(task_eval_dir, _EVAL_SUMMARY_CSV), row)
 
         gdir = _global_eval_summary_dir()
         _append_text(os.path.join(gdir, _EVAL_SUMMARY_GLOBAL_TXT), plain_sep)

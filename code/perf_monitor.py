@@ -1,6 +1,7 @@
 """
 轻量级 PyTorch 训练性能监控模块
-- 每 epoch 多行日志：Epoch 标题 → 空行 → time/Total/Step → 空行 → GPU → 空行 → CPU → 空行（再接 Loss 由训练脚本写入）
+- epoch_end(emit_log=False) 时仅记录 metrics 并返回 rec，由 train_logging.format_epoch_training_block 统一多行输出
+- emit_log=True（默认）时保留单行 INFO 兼容旧脚本（如 generate_counterfactual）
 - 训练结束输出一张美观的总汇总表格
 - 无侵入、不影响训练速度
 """
@@ -214,7 +215,7 @@ class PerfMonitor:
                 except Exception:
                     pass
 
-    def epoch_end(self, epoch, n_steps):
+    def epoch_end(self, epoch, n_steps, emit_log=True):
         epoch_time = time.perf_counter() - self._epoch_start_time
         total_time = time.perf_counter() - self.total_start
         step_time = epoch_time / n_steps if n_steps > 0 else 0
@@ -242,6 +243,9 @@ class PerfMonitor:
         }
         self.records.append(rec)
 
+        if not emit_log:
+            return rec
+
         lines_out = [
             f"Epoch {epoch}",
             "",
@@ -264,6 +268,7 @@ class PerfMonitor:
         else:
             print(block, flush=True)
             append_log_dual(self.log_file, block + "\n")
+        return rec
 
     def finish(self):
         if not self.records:
