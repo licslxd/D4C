@@ -1,0 +1,19 @@
+---
+description: 修改 sh 脚本或 paths_config 时同步更新三份说明文档（含路径备忘）
+globs: sh/**/*.sh,code/paths_config.py
+alwaysApply: false
+---
+
+# `sh/` 脚本、`paths_config` 与文档同步
+
+凡修改 **`sh/` 下任意 `*.sh`** 或 **`code/paths_config.py`**（参数、默认、日志/checkpoint 规则、`D4C_ROOT` 相关行为等），**在同一提交内**须同步更新以下三份 Markdown，使叙述与源码一致：
+
+1. `sh/用法速查 copy 2.md` — 速查表、示例命令、`checkpoints/` / `log/` 与各脚本摘要
+2. `sh/脚本参数说明 copy 2.md` — 必填/可选参数、默认值、互斥项、与 Python/torchrun 的衔接
+3. `路径规范备忘 copy.md` — 路径总览、与 `paths_config` / `sh/` 对齐、排障要点
+
+**原则**：以脚本与 `paths_config.py` 为准；文档之间若有不一致，以源码为准并修正文档。
+
+**自检**：对照脚本的 `usage`/注释、`case` 分支、`export`；对照 `get_checkpoint_task_dir` / `get_log_task_dir` 等与路径备忘中的表格。
+
+**Git**：仓库已提供 `.githooks/pre-commit`；在仓库根执行 `bash sh/install_git_hooks.sh`（或 `git config core.hooksPath .githooks`）后，提交时若暂存了 `sh/*.sh` 或 `code/paths_config.py`，会强制要求同批暂存上述三份文档。
