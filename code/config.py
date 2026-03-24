@@ -18,9 +18,20 @@ num_proc = min(_num_cpu, _MAX_PARALLEL_CPU)
 
 # 全局配置（Step 3/4/5 训练与推理）
 # 可通过 run_step3/4/5.sh --batch-size N 或各 Python 脚本 --batch-size N 覆盖
-train_batch_size = 1024  # Step 3 域对抗预训练、Step 4 反事实生成、Step 5 主训练的批次大小，显存不足时可减小
+train_batch_size = 2048  # Step 3 域对抗预训练、Step 4 反事实生成、Step 5 主训练的批次大小，显存不足时可减小
+# eval 推理阶段全局 batch_size（Step 3 AdvTrain eval 与 Step 5 run-d4c eval 共用；DDP 下每 rank = eval_batch_size / world_size）
+# generate()+entropy 中间张量很大，不宜盲目大于 train_batch_size；OOM 时减小或设 EVAL_BATCH_SIZE=512
+eval_batch_size = int(os.environ.get("EVAL_BATCH_SIZE", "2560"))
 # 可通过 run_step3/5.sh --epochs N 或 torchrun AdvTrain.py train / torchrun run-d4c.py --epochs N 覆盖
 epochs = 50  # Step 3 域对抗预训练、Step 5 主训练的轮数
+
+# 早停与选模（可被 CLI 或环境变量覆盖；见 AdvTrain / run-d4c）
+# TRAIN_MIN_EPOCHS：至少训练多少 epoch 后才允许因 valid 变差而早停（默认 30，避免十余轮就停）
+# TRAIN_EARLY_STOP_PATIENCE：valid 连续变差次数阈值（默认 15）；改进时会清零（与旧版累计计数不同）
+# TRAIN_BLEU4_MAX_SAMPLES：按 BLEU-4 选模时，验证集最多用多少条算分（省时间）
+_train_min_epochs = max(1, int(os.environ.get("TRAIN_MIN_EPOCHS", "30")))
+_train_early_stop_patience = max(1, int(os.environ.get("TRAIN_EARLY_STOP_PATIENCE", "15")))
+_train_bleu4_max_samples = max(64, int(os.environ.get("TRAIN_BLEU4_MAX_SAMPLES", "2048")))
 
 task_configs = {
     1: {
@@ -91,13 +102,33 @@ def get_embed_batch_size():
 
 
 def get_train_batch_size():
-    """返回训练/推理的 batch_size，供 Step 3/4/5 使用"""
+    """返回训练的 batch_size，供 Step 3/4/5 使用"""
     return train_batch_size
+
+
+def get_eval_batch_size():
+    """返回 eval 推理阶段的全局 batch_size（Step 3 / Step 5）；DDP 下每 rank = 该值 / world_size"""
+    return eval_batch_size
 
 
 def get_epochs():
     """返回训练轮数，供 Step 3/5 使用"""
     return epochs
+
+
+def get_train_min_epochs():
+    """至少训练轮数后再允许早停（与 TRAIN_MIN_EPOCHS 一致）"""
+    return _train_min_epochs
+
+
+def get_train_early_stop_patience():
+    """valid 连续变差多少次触发早停（与 TRAIN_EARLY_STOP_PATIENCE 一致）"""
+    return _train_early_stop_patience
+
+
+def get_train_bleu4_max_samples():
+    """验证集 BLEU-4 选模时的最大样本条数"""
+    return _train_bleu4_max_samples
 
 
 def get_num_proc():

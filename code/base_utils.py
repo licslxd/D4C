@@ -102,7 +102,25 @@ def T5_shift_right(input_ids):
     return shifted_input_ids
 
 
-            
+def compute_bleu1234_only(predictions, references):
+    """
+    仅计算 BLEU-1~4（与 evaluate_text 中词级 BLEU 口径一致），用于训练阶段按验证集 BLEU-4 选模，避免 METEOR/BERT 开销。
+    """
+    predictions_tokens = [word_tokenize(prediction) for prediction in predictions]
+    references_tokens = [word_tokenize(reference) for reference in references]
+    formatted_ref = [[ref] for ref in references_tokens]
+    out = {}
+    for order in (1, 2, 3, 4):
+        try:
+            bleu_n, _, _, _, _, _ = compute_bleu(
+                formatted_ref, predictions_tokens, max_order=order, smooth=False
+            )
+            out[str(order)] = round(bleu_n * 100, 2)
+        except Exception:
+            out[str(order)] = 0.0
+    return out
+
+
 def evaluate_text(predictions, references):
     """
     Example:
@@ -196,13 +214,15 @@ def evaluate_text(predictions, references):
         meteor_score = 0.0
 
     # bert_score (离线：使用本地 bertscore 脚本 + hf_cache 中的 microsoft/deberta-xlarge-mnli)
-    try:
+    # SKIP_BERTSCORE=1 时跳过（加载 deberta-xlarge-mnli 并逐条推理是 eval 最大瓶颈）
+    _skip_bert = os.environ.get("SKIP_BERTSCORE", "1") == "1"
+    if not _skip_bert:
+      try:
         import evaluate
         _base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         _hf_cache = os.path.join(_base, "pretrained_models", "hf_cache")
         _bs_script = os.path.join(_base, "pretrained_models", "evaluate_bertscore", "bertscore.py")
         _deberta_snapshot = os.path.join(_hf_cache, "models--microsoft--deberta-xlarge-mnli", "snapshots", "5b07a9086c1dbb79981ff7b05b4d1ad83b3af51c")
-        # 优先使用本地缓存的模型路径，避免离线时从 Hub 拉取失败
         _model_type = _deberta_snapshot if os.path.exists(_deberta_snapshot) else "microsoft/deberta-xlarge-mnli"
         if _model_type == _deberta_snapshot:
             for _var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
@@ -210,7 +230,6 @@ def evaluate_text(predictions, references):
                     os.environ[_var] = _hf_cache
                     break
         bertscore = evaluate.load(_bs_script)
-        # 不改变 BERTScore 定义，仅调 batch 吞吐；默认 64 与 evaluate 脚本一致；加速可 export BERTSCORE_BATCH_SIZE=128
         try:
             _bert_bs = int(os.environ.get("BERTSCORE_BATCH_SIZE", "64"))
         except ValueError:
@@ -238,16 +257,18 @@ def evaluate_text(predictions, references):
         finally:
             sys.stderr = _prev_err
         bert_score = round(np.mean(bert_score["f1"])*100, 2)
-    except Exception as e:
+      except Exception as e:
         import warnings
         warnings.warn(f"BERTScore 计算失败，已回退为 0.0。原因: {e}", UserWarning)
         bert_score = 0.0
-    return {
+    result = {
             "rouge": {"1":rouge_s["rouge_1/f_score"], "2":rouge_s["rouge_2/f_score"], "l":rouge_s["rouge_l/f_score"]},
             "bleu": {"1":bleu1, "2":bleu2, "3":bleu3, "4":bleu4}, 
             "dist": {"1":dist1, "2":dist2},
-            "meteor": meteor_score, 
-            "bert":bert_score}
+            "meteor": meteor_score}
+    if not _skip_bert:
+        result["bert"] = bert_score
+    return result
 
 
 class PositionalEncoding(nn.Module):
