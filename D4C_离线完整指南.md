@@ -320,7 +320,8 @@ DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 run-d4c.py \
 # 多卡（与可见 GPU 数一致；全局 batch 须能被进程数整除）
 DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 run-d4c.py \
   --auxiliary AM_Electronics --target AM_CDs --epochs 50 --batch-size 1024
-# 或（在项目根目录）：bash sh/run_step5.sh --task 1
+# 或（在项目根目录，须指定 Step 3 子目录名）：bash sh/run_step5.sh --task 1 --step3-subdir step3_YYYYMMDD_HHMM
+# 或（各任务 Step 3/4 已就绪，自动选每任务最新 step3_*）：bash sh/run_step5_all.sh
 ```
 
 ---
@@ -336,7 +337,8 @@ DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 run-d4c.py \
 | `run_step1_step2.sh` | Step 1+2 合并，支持 `--embed-batch-size N`、`--gpus 0,1` |
 | `run_step3.sh` | Step 3（DDP）：train 与 eval 均 `torchrun`；`DDP_NPROC` 或 `--ddp-nproc K`；`--gpus` 仅在你手动单进程跑 eval 时有意义，脚本内已忽略 |
 | `run_step4.sh` | Step 4，`--all` / `--task N`，支持 `--gpus 0,1` |
-| `run_step5.sh` | Step 5（DDP），`--all` / `--task N`；`DDP_NPROC` 或 `--ddp-nproc K` |
+| `run_step5.sh` | Step 5（DDP）**仅嵌套**：`--task N` + `--step3-subdir`；`DDP_NPROC` 或 `--ddp-nproc K`（无 `--all`） |
+| `run_step5_all.sh` | Step 5 **批量任务 1–8**：仅调 `run_step5.sh`，每任务自动最新 `step3_*`；`--eval-only` 时再自动最新 `step5_*`；汇总 `log/step5_all_*.log` |
 | `run_step3_to_step5_all.sh` | Step 3-5 全部任务，支持 `--from N` 续跑、`--gpus`（Step4 等）、`--ddp-nproc K`（Step3 train+eval + Step5） |
 | `run_step3_to_step5_single.sh` | Step 3-5 单个任务，`--task N`，同上 |
 
