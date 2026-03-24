@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# 启用方式（仓库根目录执行一次）：
+#   git config core.hooksPath .githooks
+# 或：bash sh/install_git_hooks.sh
+# 跳过本次检查：git commit --no-verify
+
+set -euo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+STAGED=$(git diff --cached --name-only)
+
+need_sync_docs=0
+if printf '%s\n' "$STAGED" | grep -q '^sh/.*\.sh$'; then
+  need_sync_docs=1
+fi
+if printf '%s\n' "$STAGED" | grep -Fxq 'code/paths_config.py'; then
+  need_sync_docs=1
+fi
+
+if [[ "$need_sync_docs" -eq 0 ]]; then
+  exit 0
+fi
+
+DOC1='sh/用法速查 copy 2.md'
+DOC2='sh/脚本参数说明 copy 2.md'
+DOC3='路径规范备忘 copy.md'
+
+missing=()
+for f in "$DOC1" "$DOC2" "$DOC3"; do
+  if ! printf '%s\n' "$STAGED" | grep -Fxq "$f"; then
+    missing+=("$f")
+  fi
+done
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo 'pre-commit: 检测到已暂存对 sh/*.sh 或 code/paths_config.py 的修改，须在同一提交中同步暂存以下文档：' >&2
+  for f in "${missing[@]}"; do
+    printf '  - %s\n' "$f" >&2
+  done
+  echo '（若本次改动不影响文档内容，可仍暂存文档并做一次无实质修改的保存，或改用 git commit --no-verify 跳过。）' >&2
+  exit 1
+fi
+
+exit 0
