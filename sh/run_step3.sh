@@ -117,19 +117,9 @@ BATCH_SIZE=""
 EPOCHS=""
 NUM_PROC=""
 
-# 任务 N → 一行五元组：辅助域 目标域 学习率 coef adv
+# 任务 N → 一行五元组：辅助域 目标域 学习率 coef adv（与 code/config.py task_configs 一致；若 export D4C_TRAIN_PRESET 则 adversarial_coef 可被预设覆盖）
 get_task_params() {
-    case $1 in
-        1) echo "AM_Electronics AM_CDs 5e-4 1 0.01" ;;
-        2) echo "AM_Movies AM_CDs 1e-3 0.1 0.01" ;;
-        3) echo "AM_CDs AM_Electronics 5e-4 0.5 0.1" ;;
-        4) echo "AM_Movies AM_Electronics 1e-3 0.5 0.01" ;;
-        5) echo "AM_CDs AM_Movies 1e-3 0.5 0.01" ;;
-        6) echo "AM_Electronics AM_Movies 1e-3 0.5 0.01" ;;
-        7) echo "Yelp TripAdvisor 1e-4 0.5 0.01" ;;
-        8) echo "TripAdvisor Yelp 5e-4 1 0.01" ;;
-        *) echo "" ;;
-    esac
+    python -c "from config import format_step3_task_params_line as _line; import sys; s=_line($1); sys.stdout.write(s); sys.exit(0 if s else 1)"
 }
 
 MODE=""
@@ -243,10 +233,6 @@ fi
 
 resolve_torchrun
 
-if [ -z "$EPOCHS" ] && [ -z "$EVAL_ONLY" ]; then
-    EPOCHS="--epochs $(cd "$CODE_DIR" && python -c "from config import get_epochs; print(get_epochs())")"
-fi
-
 run_one_task() {
     local idx=$1
     local p=$(get_task_params $idx)
@@ -256,6 +242,14 @@ run_one_task() {
     local lr=$(echo $p | cut -d' ' -f3)
     local coef=$(echo $p | cut -d' ' -f4)
     local adv=$(echo $p | cut -d' ' -f5)
+    local _epochs_arg=""
+    if [ -z "$EVAL_ONLY" ]; then
+        if [ -n "$EPOCHS" ]; then
+            _epochs_arg="$EPOCHS"
+        else
+            _epochs_arg="--epochs $(cd "$CODE_DIR" && D4C_PRESET_TASK_ID="$idx" python -c "from config import get_epochs; print(get_epochs())")"
+        fi
+    fi
     if [ -n "$EVAL_ONLY" ]; then
         echo "========== Step 3 DDP Task $idx 仅 eval (nproc=$DDP_NPROC): $aux -> $tgt =========="
     elif [ -n "$TRAIN_ONLY" ]; then
@@ -266,7 +260,7 @@ run_one_task() {
     [ -n "$GPUS" ] && echo "提示: 本脚本内 eval 已用 torchrun DDP，忽略 --gpus（请用 CUDA_VISIBLE_DEVICES）"
     if [ -z "$EVAL_ONLY" ]; then
         ${TORCHRUN_BIN} --standalone --nproc_per_node="$DDP_NPROC" AdvTrain.py train \
-            --auxiliary "$aux" --target "$tgt" $EPOCHS --learning_rate "$lr" --coef "$coef" --adv "$adv" \
+            --auxiliary "$aux" --target "$tgt" $_epochs_arg --learning_rate "$lr" --coef "$coef" --adv "$adv" \
             $BATCH_SIZE $NUM_PROC \
             --log_file "$LOGFILE"
     fi

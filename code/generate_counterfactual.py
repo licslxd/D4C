@@ -279,7 +279,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    batch_size = args.batch_size if args.batch_size is not None else get_train_batch_size()
     nproc = args.num_proc if args.num_proc is not None else get_num_proc()
     device_ids = [int(x.strip()) for x in args.gpus.split(",")]
 
@@ -296,6 +295,11 @@ if __name__ == "__main__":
 
     try:
         for task_idx in task_range:
+            batch_size = (
+                args.batch_size
+                if args.batch_size is not None
+                else get_train_batch_size(task_idx)
+            )
             lf = args.log_file if args.log_file is not None else "save.log"
             lf = os.path.abspath(os.path.expanduser(lf))
             _run_one_task(

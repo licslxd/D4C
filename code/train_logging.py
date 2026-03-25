@@ -280,7 +280,9 @@ def format_epoch_training_block(
     train_loss: float,
     valid_loss: Optional[float] = None,
     adv_loss: Optional[float] = None,
+    adversarial_coef: Optional[float] = None,
     bleu_line: Optional[str] = None,
+    lr_schedule_detail: Optional[str] = None,
 ) -> str:
     """每 epoch 一块多行纯文本（无 logging 时间戳/级别前缀），与 perf_monitor 的 rec 字段对齐。
 
@@ -296,8 +298,12 @@ def format_epoch_training_block(
         parts5.append(f"valid_loss={valid_loss:.4f}")
     if adv_loss is not None:
         parts5.append(f"adv_loss={adv_loss:.4f}")
+    if adversarial_coef is not None:
+        parts5.append(f"adversarial_coef={adversarial_coef:.6g}")
     line5 = "\t|\t".join(parts5)
     detail = [line3, line4, line5]
+    if lr_schedule_detail is not None:
+        detail.append(lr_schedule_detail.rstrip())
     if bleu_line is not None:
         detail.append(bleu_line.rstrip())
     indent = "    "

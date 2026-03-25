@@ -256,7 +256,7 @@ fi
 resolve_torchrun
 
 if [ -z "$EPOCHS" ] && [ -z "$EVAL_ONLY" ]; then
-    EPOCHS="--epochs $(cd "$CODE_DIR" && python -c "from config import get_epochs; print(get_epochs())")"
+    EPOCHS="--epochs $(cd "$CODE_DIR" && D4C_PRESET_TASK_ID="$TASK_ID" python -c "from config import get_epochs; print(get_epochs())")"
 fi
 
 if [ -z "${INTERNAL_NOHUP:-}" ]; then

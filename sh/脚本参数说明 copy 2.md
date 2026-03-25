@@ -29,7 +29,9 @@
 
 - **`run_step3.sh` 的默认**：未手动设置 `D4C_CHECKPOINT_SUBDIR` 时，Step 3 会设 `GROUP=step3`、`SUBDIR=step3_<时间戳>`，**`train.log`** 在 **`log/<task>/step3/runs/…/`**。**`run_step5.sh`** **仅嵌套 checkpoint**（**`D4C_CHECKPOINT_GROUP=step3`**），但默认 **`export D4C_LOG_GROUP=step5`**（仅当调用前未设 **`D4C_LOG_GROUP` / `D4C_LOG_SUBDIR` / `D4C_LOG_STEP`**），故 **`train.log`** 在 **`log/<task>/step5/runs/…/`**，与 Step 3 日志分离；不再使用 **`checkpoints/<task>/step5/step5_*`**。**`run_step5.sh`** 默认 **`export HF_EVALUATE_OFFLINE=1`**（若环境中已设置则保留原值）。**`--eval-only`** 与 **`--train-only`** **互斥**。
 
-- **torchrun 解析**：`run_step3.sh` / **`run_step4.sh`** / `run_step5.sh` 优先使用 **`torchrun`**（**`run_step5_all.sh`** 经 **`run_step5.sh`** 间接相同）；若未安装该命令但可 **`import torch`**，则回退 **`python -m torch.distributed.run`**。
+- **工程优化脚本（`*_optimized.sh`）**：与复现脚本**并行存在**，不修改后者默认值。**`run_step3_optimized.sh`** → **`run_step4_optimized.sh`**（须 **`--step3-subdir`** 与 Step3 的 **`step3_opt_*`** 一致）→ **`run_step5_optimized.sh`**。**`run_step3_to_step5_*.sh` / `run_step5_all.sh`** 仍只调用 **`run_step3.sh` / `run_step4.sh` / `run_step5.sh`**，不自动使用 optimized 目录。
+
+- **torchrun 解析**：`run_step3.sh` / **`run_step4.sh`** / `run_step5.sh` 及 **`run_step*_optimized.sh`** 优先使用 **`torchrun`**（**`run_step5_all.sh`** 经 **`run_step5.sh`** 间接相同）；若未安装该命令但可 **`import torch`**，则回退 **`python -m torch.distributed.run`**。
 
 - **镜像日志**：**`D4C_MIRROR_LOG=1`** 时，`append_log_dual` 可额外写入 **`code/log.out`**；主文件仍以脚本传入的 `--log_file`（`**runs/…/train.log**`）为准。
 
@@ -44,6 +46,8 @@
 ---
 
 ## 二、各脚本必填与默认
+
+**小节顺序**：与流水线一致 — **Step 1+2** → **Step 3**（含 **`run_step3_optimized.sh`**）→ **Step 4**（含 **`run_step4_optimized.sh`**）→ **Step 5**（含 **`run_step5_optimized.sh`**、`run_step5_all.sh`）→ **串联脚本**。
 
 ### run_step1_step2.sh
 
@@ -70,7 +74,48 @@
 | 可选 | `--ddp-nproc K` | 不传则用环境变量 `DDP_NPROC`，再缺省为 2 |
 | 可选 | `--daemon` / `--bg` | 不传则前台执行 |
 
+**任务超参（auxiliary / target / lr / coef / adv）**：由 **`code/config.py`** 的 **`task_configs`** 经 **`format_step3_task_params_line`** 生成。若 **`export D4C_TRAIN_PRESET=<键名>`**，**`TRAINING_PRESETS`** 可为**全局**一条 dict 或**按任务 1–8** 分条；后者下各任务的 **`adv` / `train_batch_size` / `epochs` / `full_eval_every_epochs` / `min_lr_ratio`** 可分别覆盖（**`run_step3.sh`** 每任务设 **`D4C_PRESET_TASK_ID`** 以解析 shell 侧 **`get_epochs`**）。优先级低于 CLI 与 **`D4C_MIN_LR_RATIO` / `D4C_FULL_EVAL_EVERY`** 等。详见 **`config.py`** 中 **`TRAINING_PRESETS`** 注释。
+
 **Step 3 与结构化日志**：`run_step3.sh` 使用 **`d4c_step3_logfile`**（与 **`d4c_step5_logfile`** 规则一致）：**`LOGFILE=<get_log_task_dir(task)>/runs/<YYYYMMDDHHMMSS>/train.log`**；**`D4C_LOG_USE_TIMESTAMP=0`** 时为 **`…/runs/run/train.log`**，传给 **`AdvTrain.py --log_file`**；前台**不对** `LOGFILE` 再 `tee`。**`--daemon`** 单任务时另有同目录 **`nohup.log`**。**`D4C_MIRROR_LOG=1`** 时可再镜像 **`code/log.out`**。**`--all --daemon`** 时另有 **`log/step3_daemon_*.log`**（**`--eval-only`** 时为 **`step3_eval_daemon_*.log`**）。
+
+---
+
+### run_step3_optimized.sh
+
+| 类型 | 参数 | 说明 |
+|------|------|------|
+| **与 `run_step3.sh` 相同** | `--all` / `--task N` / `--eval-only` / `--train-only` / `--batch-size` / … | 全部原样转发给 **`run_step3.sh`** |
+
+**本脚本在 `exec` 前设置（可用环境变量覆盖）**：**`D4C_TRAIN_MODE=optimized`**、**`D4C_LR_SCHEDULER=warmup_cosine`**、**`D4C_WARMUP_RATIO`**（默认 0.05）、**`D4C_QUICK_EVAL_MAX_SAMPLES`**（默认 512）、**`TRAIN_EARLY_STOP_PATIENCE_FULL`**（默认 4）、**`TRAIN_MIN_EPOCHS`**（默认 8）、**`TRAIN_EARLY_STOP_PATIENCE`**（默认 6）、**`TRAIN_BLEU4_MAX_SAMPLES`**（默认 512）。**`D4C_FULL_EVAL_EVERY`**：脚本**不再**默认 `export`；未设置且未使用命名预设中的 **`full_eval_every_epochs`** 时，由 Python 采用**分阶段 full BLEU**（默认 epoch≤10 每 5 轮、之后每 2 轮，见 `config.resolve_full_bleu_eval_training`）；需要固定间隔时显式 **`export D4C_FULL_EVAL_EVERY=N`**，或使用 **`D4C_TRAIN_PRESET`**（见上节）。**Checkpoint**：默认 **`D4C_CHECKPOINT_GROUP=step3_optimized`**、**`D4C_CHECKPOINT_SUBDIR=step3_opt_<分秒时间戳>`**（若调用前已 `export D4C_CHECKPOINT_SUBDIR` 则保留）。**日志**：默认 **`D4C_LOG_GROUP=step3_optimized`**（若已设置 **`D4C_LOG_GROUP` / `D4C_LOG_SUBDIR` / `D4C_LOG_STEP`** 则不覆盖）。**大 batch**：未出现 **`--batch-size`** 时**追加** **`--batch-size`**，默认值为 **`python -c "from config import get_train_batch_size; …"`**（模块默认 **2048**；**`D4C_TRAIN_PRESET`** 可改变该默认），仍可用 **`D4C_OPT_BATCH_SIZE`** 覆盖。
+
+---
+
+### run_step4.sh
+
+| 类型 | 参数 | 说明 |
+|------|------|------|
+| **必填** | `--all` 或 `--task N` | 二选一，必须指定其一 |
+| 可选 | `--from N` | 仅配合 `--all`，默认 1 |
+| 可选 | `--skip N,M,...` | 默认不跳过 |
+| 可选 | `--batch-size N` | 不传则由 config 决定；**全局 batch 须能被 `DDP_NPROC` 整除** |
+| 可选 | `--num-proc N` | 不传则由 config 决定 |
+| 可选 | `--ddp-nproc K` | 不传则用环境变量 **`DDP_NPROC`**，再缺省为 **2** |
+| 可选 | `--daemon` / `--bg` | 不传则前台执行；单任务时 **`nohup.log`** 与 **`train.log`** 同目录；**`--all`** 时另有 **`log/step4_daemon_*.log`** |
+
+**Step 4 与 DDP**：默认 **`torchrun --standalone --nproc_per_node=$DDP_NPROC` `generate_counterfactual.py`**；须与可见 GPU 数一致；多卡 **`CUDA_VISIBLE_DEVICES`**。单卡：**`DDP_NPROC=1`**。手动单进程（不推荐）：`cd code && python generate_counterfactual.py …`，与上述 shell 默认 torchrun 路径不同。
+
+**Step 4 与结构化日志**：脚本默认 **`export D4C_LOG_STEP=step4`**（仅当调用前**未设置**该变量；若 **`export D4C_LOG_STEP=`** 为空字符串则主日志改随 **`D4C_CHECKPOINT_*`** 同表）。主日志 **`get_log_task_dir(task)/runs/<时间戳>/train.log`**，经 **`generate_counterfactual.py --log_file`** 写入 **`PerfMonitor`**；**不对**该文件再 **`tee`**（与 Step 3/5 一致）。**`D4C_MIRROR_LOG=1`** 时可再镜像 **`code/log.out`**；未传 **`--log_file`** 时 Python 默认仍写当前工作目录 **`save.log`**。
+
+---
+
+### run_step4_optimized.sh
+
+| 类型 | 参数 | 说明 |
+|------|------|------|
+| **与 `run_step4.sh` 相同** | `--all` / `--task N` / `--batch-size` / … | 全部原样转发给 **`run_step4.sh`**（**`--step3-subdir` 会剥离，不传给 Python**） |
+| **必填（本脚本）** | `--step3-subdir NAME` | 与 **`checkpoints/<task>/step3_optimized/<NAME>/`** 一致；用于设置 **`D4C_CHECKPOINT_SUBDIR`** |
+
+**本脚本在 `exec` 前设置**：**`D4C_TRAIN_MODE=optimized`**、**`D4C_CHECKPOINT_GROUP=step3_optimized`**、**`D4C_CHECKPOINT_SUBDIR=<NAME>`**。若未预先设置 **`D4C_LOG_GROUP` / `D4C_LOG_SUBDIR`**，则 **`D4C_LOG_STEP=step4_optimized`**（主日志 **`log/<task>/step4_optimized/…`**）。未出现 **`--batch-size`** 时**追加** **`--batch-size`**，默认 **`config.get_train_batch_size()`**（**`D4C_OPT_BATCH_SIZE`** 仍可覆盖）。
 
 ---
 
@@ -99,6 +144,16 @@
 
 ---
 
+### run_step5_optimized.sh
+
+| 类型 | 参数 | 说明 |
+|------|------|------|
+| **与 `run_step5.sh` 相同** | `--task N`、`--step3-subdir`、`--nested-subdir`、… | 参数表一致 |
+
+**与 `run_step5.sh` 的差异**：物理目录 **`checkpoints/<task>/step3_optimized/<NAME>/`**（**`--step3-subdir`** 须为该目录下文件夹名，通常由 **`run_step3_optimized.sh`** 生成）；**`D4C_CHECKPOINT_GROUP=step3_optimized`**；训练默认内层 **`step5_opt_<YYYYMMDD_HHMM>`**（**`--eval-only`** 时仍须 **`--nested-subdir <已有内层>`**）。主日志默认 **`log/<task>/step5_optimized/`**；**`torchrun run-d4c.py`** 额外传入 **`--train-mode optimized`**、**`--min-epochs`**、**`--early-stop-patience-full`**、**`--quick-eval-max-samples`**、**`--bleu4-max-samples`**、**`--warmup-ratio`**；仅当已设置 **`D4C_FULL_EVAL_EVERY`** 时再传入 **`--full-eval-every`**（否则与 Step3 optimized 一致，由 Python 分阶段 full BLEU 或命名预设决定）。未传 **`--batch-size`** 且非 **`--eval-only`** 时默认 **`--batch-size`** 为 **`config.get_train_batch_size()`**（**`D4C_OPT_BATCH_SIZE`** 仍可覆盖）。
+
+---
+
 ### run_step5_all.sh
 
 | 类型 | 参数 | 说明 |
@@ -114,24 +169,6 @@
 **每任务**：自动 **`--step3-subdir`** = **`checkpoints/<task>/step3/`** 下 **`ls -1td step3_*`** 最新目录名；**`--eval-only`** 时再 **`--nested-subdir`** = 该 Step 3 目录下 **`step5/step5_*`** 最新内层名。
 
 **汇总日志**：每次运行（含前台）在 **`log/step5_all_<时间>.log`** 中 **`tee`** 各任务子进程输出；单任务结构化日志仍以 **`log/<task>/step5/runs/…/train.log`** 为准。
-
----
-
-### run_step4.sh
-
-| 类型 | 参数 | 说明 |
-|------|------|------|
-| **必填** | `--all` 或 `--task N` | 二选一，必须指定其一 |
-| 可选 | `--from N` | 仅配合 `--all`，默认 1 |
-| 可选 | `--skip N,M,...` | 默认不跳过 |
-| 可选 | `--batch-size N` | 不传则由 config 决定；**全局 batch 须能被 `DDP_NPROC` 整除** |
-| 可选 | `--num-proc N` | 不传则由 config 决定 |
-| 可选 | `--ddp-nproc K` | 不传则用环境变量 **`DDP_NPROC`**，再缺省为 **2** |
-| 可选 | `--daemon` / `--bg` | 不传则前台执行；单任务时 **`nohup.log`** 与 **`train.log`** 同目录；**`--all`** 时另有 **`log/step4_daemon_*.log`** |
-
-**Step 4 与 DDP**：默认 **`torchrun --standalone --nproc_per_node=$DDP_NPROC` `generate_counterfactual.py`**；须与可见 GPU 数一致；多卡 **`CUDA_VISIBLE_DEVICES`**。单卡：**`DDP_NPROC=1`**。手动单进程（不推荐）：`cd code && python generate_counterfactual.py …`，与上述 shell 默认 torchrun 路径不同。
-
-**Step 4 与结构化日志**：脚本默认 **`export D4C_LOG_STEP=step4`**（仅当调用前**未设置**该变量；若 **`export D4C_LOG_STEP=`** 为空字符串则主日志改随 **`D4C_CHECKPOINT_*`** 同表）。主日志 **`get_log_task_dir(task)/runs/<时间戳>/train.log`**，经 **`generate_counterfactual.py --log_file`** 写入 **`PerfMonitor`**；**不对**该文件再 **`tee`**（与 Step 3/5 一致）。**`D4C_MIRROR_LOG=1`** 时可再镜像 **`code/log.out`**；未传 **`--log_file`** 时 Python 默认仍写当前工作目录 **`save.log`**。
 
 ---
 
@@ -175,9 +212,10 @@
 | 配置项 | 默认值 | 用途 |
 |--------|--------|------|
 | `embed_batch_size` | **1024** | Step 1+2 嵌入计算的 batch size |
-| `train_batch_size` | **2048** | Step 3/4/5 训练与推理的 batch size（`config.py`；显存不足可 `--batch-size` 减小） |
+| `train_batch_size` | **2048** | 模块默认；运行时以 **`get_train_batch_size()`** 为准（**`D4C_TRAIN_PRESET`** 可覆盖）。Step 3/4/5 训练与推理 batch；显存不足可 **`--batch-size`** 减小 |
 | `eval_batch_size` | **2560**（可用环境变量 **`EVAL_BATCH_SIZE`** 覆盖） | Step 5 **eval** 阶段全局 batch；DDP 下每 rank = 该值 / `world_size`；OOM 时可减小 |
-| `epochs` | **50** | Step 3 域对抗、Step 5 主训练的轮数 |
+| `epochs` | **50** | 模块默认；运行时以 **`get_epochs()`** 为准（**`D4C_TRAIN_PRESET`** 可覆盖）。Step 3 域对抗、Step 5 主训练轮数 |
+| `TRAINING_PRESETS` / **`D4C_TRAIN_PRESET`** | 见 **`config.py`** | 命名预设：可为**全局**一条 dict，或**按任务** `1..8` → 字段 dict（各任务可不同）。**`gb1024_ep30_fe2`** 为按任务表，默认 8 项相同（batch **1024**、**30** epoch、每 **2** epoch full BLEU、**`min_lr_ratio=0.1`**、**`adv=0.005`**）。**`run_step3.sh`** / **`run_step5*.sh`** 通过 **`D4C_PRESET_TASK_ID`** 解析 epochs / batch；按任务预设时 **`run_step3_optimized.sh`** 等可不统一注入 **`--batch-size`** |
 | `num_proc` | **min(有效 CPU 核数, MAX_PARALLEL_CPU)** | 仅 **`datasets.map`（Tokenize）** 等并行进程数 |
 | `MAX_PARALLEL_CPU` | 环境变量，**默认 12** | 与常见 GPU 节点 `nproc≈12` 对齐；更大机器可 `export MAX_PARALLEL_CPU=16` |
 | DataLoader workers | `get_dataloader_num_workers(train/valid/test)` | 与 `num_proc` **独立**，上限随 `MAX_PARALLEL_CPU` 收紧 |

@@ -4,6 +4,10 @@
 - emit_log=True（默认）时保留单行 INFO 兼容旧脚本（如 generate_counterfactual）
 - 训练结束输出一张美观的总汇总表格
 - 无侵入、不影响训练速度
+
+DDP 多进程注意：仅 rank0 创建 PerfMonitor 时，epoch_end 内用 torch.cuda.max_memory_allocated(其它卡)
+在本进程往往恒为 0（显存实际在其它 rank 上）。多卡训练请在每个 epoch 由 **全体 rank** 调用
+gather_ddp_gpu_stats_for_epoch_log，再让 rank0 把返回值写入 rec 的 gpu_util / gpu_mem（见 AdvTrain / run-d4c）。
 """
 
 import time
@@ -11,7 +15,7 @@ import sys
 import os
 import logging
 
-from typing import Optional
+from typing import Optional, Tuple
 
 from cpu_utils import effective_cpu_count
 from paths_config import append_log_dual
@@ -107,7 +111,20 @@ def _get_gpu_util_multi(device_ids):
 
 
 def _get_gpu_mem(device_id=0):
-    """返回 (显示字符串, 字节数或None)"""
+    """返回 (显示字符串, 字节数或None)。
+
+    优先用 NVML 的显存占用，与 nvidia-smi 一致，且在多进程 DDP 下仍能对「非本进程绑定的卡」
+    给出正确读数。若仅用 torch.cuda.max_memory_allocated，则只有当前进程在该 device 上
+    分配过张量才有非零值，另一张卡常会误显示为 0。
+    """
+    if _pynvml_ok:
+        try:
+            h = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+            b = mem.used
+            return f"{b / 1024**3:.2f}G", b
+        except Exception:
+            pass
     if not HAS_CUDA or not torch.cuda.is_available():
         return "-", None
     try:
@@ -132,6 +149,98 @@ def _get_gpu_mem_multi(device_ids):
         except Exception:
             pass
     return " ".join(parts) if parts else "-", total_bytes if total_bytes else None
+
+
+def _nvml_physical_index_for_torch_cuda_device(torch_cuda_idx: int) -> Optional[int]:
+    """
+    将当前进程内可见的 cuda 设备序号映射到 NVML 的 GPU 索引。
+    未设置 CUDA_VISIBLE_DEVICES 时二者一致；设置为 \"4,5\" 时 cuda:0 -> 4。
+    """
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not vis:
+        return int(torch_cuda_idx)
+    parts = [p.strip() for p in vis.split(",") if p.strip()]
+    if torch_cuda_idx < 0 or torch_cuda_idx >= len(parts):
+        return int(torch_cuda_idx)
+    p = parts[torch_cuda_idx]
+    if p.isdigit():
+        return int(p)
+    return int(torch_cuda_idx)
+
+
+def _local_rank_gpu_util_percent(torch_cuda_idx: int) -> float:
+    """当前 rank 对应 GPU 的利用率 0–100；不可用返回 -1.0。"""
+    if not _pynvml_ok:
+        return -1.0
+    phy = _nvml_physical_index_for_torch_cuda_device(torch_cuda_idx)
+    try:
+        h = pynvml.nvmlDeviceGetHandleByIndex(int(phy))
+        return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+    except Exception:
+        return -1.0
+
+
+def gather_ddp_gpu_stats_for_epoch_log(
+    rank: int, world_size: int, cuda_device_index: int
+) -> Tuple[str, str, Optional[int]]:
+    """
+    DDP 训练每个 epoch 在同一点由 **所有 rank** 调用一次。
+
+    - 各 rank 读取 **本进程当前 device** 的 torch.cuda.memory_allocated / memory_reserved
+      以及（若 NVML 可用）对应物理 GPU 的利用率。
+    - 经 all_gather 汇总后，返回全 rank 拼好的日志字符串与峰值字节（供 PerfMonitor 汇总表）。
+
+    单卡或未初始化分布式时：不调用 collective，等价于 world_size==1。
+
+    Returns:
+        (gpu_util_str, gpu_mem_str, peak_bytes)
+    """
+    if not HAS_CUDA or not torch.cuda.is_available():
+        return "-", "-", None
+
+    import torch.distributed as dist
+
+    local_idx = int(torch.cuda.current_device())
+    dev = torch.device(f"cuda:{int(cuda_device_index)}")
+    alloc_b = float(torch.cuda.memory_allocated(local_idx))
+    resv_b = float(torch.cuda.memory_reserved(local_idx))
+    util = _local_rank_gpu_util_percent(local_idx)
+
+    use_dist = (
+        world_size is not None
+        and int(world_size) > 1
+        and dist.is_available()
+        and dist.is_initialized()
+    )
+
+    if not use_dist:
+        u_str = f"{int(util)}%" if util >= 0.0 else "-"
+        gpu_util = f"0:{u_str}"
+        gpu_mem = (
+            f"alloc 0:{alloc_b / 1024**3:.2f}G | resv 0:{resv_b / 1024**3:.2f}G"
+        )
+        peak = int(max(alloc_b, resv_b))
+        return gpu_util, gpu_mem, peak
+
+    t = torch.tensor([alloc_b, resv_b, util], dtype=torch.float64, device=dev)
+    bufs = [torch.empty(3, dtype=torch.float64, device=dev) for _ in range(int(world_size))]
+    dist.all_gather(bufs, t)
+
+    util_parts = []
+    alloc_parts = []
+    resv_parts = []
+    peak = 0.0
+    for r in range(int(world_size)):
+        a = bufs[r][0].item()
+        rv = bufs[r][1].item()
+        u = bufs[r][2].item()
+        peak = max(peak, a, rv)
+        alloc_parts.append(f"{r}:{a / 1024**3:.2f}G")
+        resv_parts.append(f"{r}:{rv / 1024**3:.2f}G")
+        util_parts.append(f"{r}:{int(u)}%" if u >= 0.0 else f"{r}:-")
+    gpu_util = " ".join(util_parts)
+    gpu_mem = "alloc " + " ".join(alloc_parts) + " | resv " + " ".join(resv_parts)
+    return gpu_util, gpu_mem, int(peak)
 
 
 def _fmt(t):

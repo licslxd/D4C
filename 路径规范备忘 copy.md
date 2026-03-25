@@ -70,7 +70,10 @@
 **各脚本默认值（未手动 `export` 时）**
 
 - **`run_step3.sh`**：设置 `D4C_CHECKPOINT_GROUP=step3`，`D4C_CHECKPOINT_SUBDIR=step3_<时间戳>` → 例如 `checkpoints/<task>/step3/step3_<时间>/model.pth`。
+- **`run_step3_optimized.sh`**：默认 **`GROUP=step3_optimized`**、**`SUBDIR=step3_opt_<时间戳>`**，权重例如 **`checkpoints/<task>/step3_optimized/step3_opt_<时间>/model.pth`**；主日志根默认 **`log/<task>/step3_optimized/`**（**`D4C_LOG_GROUP=step3_optimized`**）。与论文复现 **`step3/step3_*`** 目录隔离。未 **`export D4C_FULL_EVAL_EVERY`** 时训练侧 full BLEU 为 Python 分阶段默认（见上表 **`D4C_FULL_EVAL_EVERY`**）。
 - **`run_step5.sh`**：**仅嵌套**：必填命令行 **`--step3-subdir`**（及 **`--task`**），不再写入 **`checkpoints/<task>/step5/step5_*`**，已移除 **`--all`**。权重：**`checkpoints/<task>/step3/<step3_id>/step5/step5_<时间>/model.pth`**（**`D4C_CHECKPOINT_GROUP=step3`**，**`SUBDIR=<step3_id>/step5/<内层>`**），csv 软链 **`../../factuals_counterfactuals.csv`**。主日志默认 **`export D4C_LOG_GROUP=step5`**（若未预先设置 **`D4C_LOG_*`**），故 **`train.log`** 在 **`log/<task>/step5/runs/…/`**，**eval 汇总**在 **`log/<task>/step5/eval/`**，与 Step 3 的 **`log/<task>/step3/`** 分开。**`run_step3_to_step5_*.sh`** 与 **`run_step5_all.sh`** 在调用前自动解析最新 **`step3_*`**（及 eval 时最新 **`step5_*`**）。
+- **`run_step5_optimized.sh`**：物理路径 **`checkpoints/<task>/step3_optimized/<step3_opt_id>/step5/step5_opt_<时间>/`**（**`--step3-subdir`** 须为该 **`step3_optimized`** 下的子目录名）；**`D4C_CHECKPOINT_GROUP=step3_optimized`**；主日志默认 **`log/<task>/step5_optimized/`**。
+- **`run_step4_optimized.sh`**：读权重 **`checkpoints/<task>/step3_optimized/<step3_opt_id>/model.pth`**（**`D4C_CHECKPOINT_GROUP=step3_optimized`**，**`SUBDIR=<step3_opt_id>`** 由 **`--step3-subdir`** 传入）；主日志默认 **`log/<task>/step4_optimized/`**（**`D4C_LOG_STEP=step4_optimized`**，与 **`D4C_LOG_GROUP` / `D4C_LOG_SUBDIR`** 未同时设置时）。
 - **仅自定义子目录**：只设 `D4C_CHECKPOINT_SUBDIR=my_exp`（不设 `GROUP`）→ `checkpoints/<task>/my_exp/…`
 
 ---
@@ -131,13 +134,15 @@
 | `D4C_MIRROR_LOG` | 设为 `1` / `true` 等时是否额外镜像到 `code/log.out`（见 6.1-C） |
 | `NLTK_DATA` | Step 3/5 脚本设为 `<D4C_ROOT>/pretrained_models/nltk_data` |
 | `HF_EVALUATE_OFFLINE` | `run_step5.sh` 默认 `export HF_EVALUATE_OFFLINE=1`（若环境已有值则保留） |
+| `D4C_FULL_EVAL_EVERY` | 设置时为固定间隔 N epoch 做 full valid BLEU；**未设置**且 **`D4C_TRAIN_MODE=optimized`** 时由 `config.resolve_full_bleu_eval_training` 使用分阶段默认（epoch≤10 每 5 轮、之后每 2 轮；可调 `D4C_FULL_EVAL_EARLY_EVERY` / `D4C_FULL_EVAL_PHASE_END_EPOCH` / `D4C_FULL_EVAL_LATE_EVERY`）；若已设 **`D4C_TRAIN_PRESET`** 且预设含 **`full_eval_every_epochs`**，则优先于分阶段默认（仍低于本变量与 CLI） |
+| `D4C_TRAIN_PRESET` | 命名训练预设（**`code/config.py`** 中 **`TRAINING_PRESETS`** 的键）。可为**全局一条**（顶层即字段 dict，所有任务相同）或**按任务 1–8**（顶层键为整数 1..8，值为各任务字段 dict）。影响 **`get_epochs` / `get_train_batch_size` / `get_min_lr_ratio` / `resolve_full_bleu_eval_training`** 及 Step 3 的 **`adv`**；**`D4C_PRESET_TASK_ID`**（**`run_step3.sh`** / **`run_step5*.sh`** 按任务设置）用于解析按任务预设。优先级低于对应 CLI 或 **`D4C_MIN_LR_RATIO` / `D4C_FULL_EVAL_EVERY`** 等。示例 **`gb1024_ep30_fe2`**：8 个任务默认均为 batch 1024、30 epoch、每 2 epoch full BLEU、`min_lr_ratio=0.1`、`adv=0.005`（可在 **`TRAINING_PRESETS`** 内按任务单独改） |
 | `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` | Slurm 模板中常见，离线推理 |
 
 ---
 
 ## 8. 任务编号与域对（1–8）
 
-与 `run_step3.sh` / `run_step5.sh` 中 `get_task_params` 一致，便于对照 `Merged_data/<task>/` 与日志目录：
+与 `run_step3.sh` 中由 **`config.format_step3_task_params_line`** 生成的域对一致（**`run_step5.sh`** 仍为脚本内 `eta` 表，二者末列语义不同），便于对照 `Merged_data/<task>/` 与日志目录：
 
 | Task | auxiliary → target |
 |------|----------------------|
