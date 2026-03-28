@@ -1,3 +1,13 @@
+"""
+DEPRECATED — not part of the supported DDP pipeline.
+
+This file is kept only for historical / experimental reference. There is no
+guarantee of compatibility with current main scripts (torchrun + AdvTrain.py /
+run-d4c.py / generate_counterfactual.py). Do not use it for reproduction.
+
+正式 Step 3：torchrun --standalone --nproc_per_node=K AdvTrain.py train ...
+（K=1 仍为 DDP smoke，非「非分布式模式」。）
+"""
 import os
 import sys
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -5,7 +15,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from base_utils import *
 from paths_config import T5_SMALL_DIR, DATA_DIR
-from config import get_dataloader_num_workers
+from config import get_dataloader_num_workers, get_dataloader_prefetch_factor
 import torch
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 import pandas as pd
@@ -423,6 +433,8 @@ if __name__ == "__main__":
                                 encoded_data['rating'],
                                 encoded_data['explanation_idx'], 
                                 encoded_data['counterfactual_idx'])
+    # Legacy 入口：未走 FinalTrainingConfig，但 workers/prefetch 与 config 层 runtime preset（D4C_RUNTIME_PRESET）及
+    # D4C_DATALOADER_WORKERS_* / D4C_PREFETCH_* 等 ENV 共享同一套 getter。
     tw = get_dataloader_num_workers("train")
     vw = get_dataloader_num_workers("valid")
     pin_mem = torch.cuda.is_available()
@@ -433,7 +445,7 @@ if __name__ == "__main__":
         num_workers=tw,
         pin_memory=pin_mem,
         persistent_workers=tw > 0,
-        prefetch_factor=2 if tw > 0 else None,
+        prefetch_factor=get_dataloader_prefetch_factor(tw, split="train"),
     )
 
     path = os.path.join(DATA_DIR, config.get('target'))
@@ -459,7 +471,7 @@ if __name__ == "__main__":
         num_workers=vw,
         pin_memory=pin_mem,
         persistent_workers=vw > 0,
-        prefetch_factor=2 if vw > 0 else None,
+        prefetch_factor=get_dataloader_prefetch_factor(vw, split="valid"),
     )
     test_dataloader = DataLoader(test_dataset, batch_size=64, shuffle=True)
 

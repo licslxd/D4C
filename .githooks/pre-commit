@@ -11,6 +11,14 @@ cd "$REPO_ROOT"
 
 STAGED=$(git diff --cached --name-only)
 
+# 暂存 presets 或校验脚本时运行 YAML 结构检查（不改变 config 运行时语义）
+if printf '%s\n' "$STAGED" | grep -qE '^presets/.*\.(yaml|yml)$|^scripts/check_presets\.py$'; then
+  if ! python3 scripts/check_presets.py; then
+    echo 'pre-commit: scripts/check_presets.py 未通过，请修正 presets 或跳过 git commit --no-verify' >&2
+    exit 1
+  fi
+fi
+
 need_sync_docs=0
 if printf '%s\n' "$STAGED" | grep -q '^sh/.*\.sh$'; then
   need_sync_docs=1
@@ -23,8 +31,9 @@ if [[ "$need_sync_docs" -eq 0 ]]; then
   exit 0
 fi
 
-DOC1='sh/用法速查 copy 2.md'
-DOC2='sh/脚本参数说明 copy 2.md'
+# 仓库内实际维护的是 copy 3（无 copy 2 文件）；与 .cursor/rules/sh-docs-sync.mdc 一致
+DOC1='sh/用法速查 copy 3.md'
+DOC2='sh/脚本参数说明 copy 3.md'
 DOC3='路径规范备忘 copy.md'
 
 missing=()

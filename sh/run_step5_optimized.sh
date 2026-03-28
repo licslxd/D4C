@@ -1,7 +1,10 @@
 #!/bin/bash
-# Step 5（工程优化入口）：主训练与评估（DDP：torchrun + run-d4c.py）
-# 与 run_step5.sh 行为对齐，但 checkpoint 根目录为 step3_optimized/，日志默认可为 step5_optimized/，
-# 并在 torchrun 前注入 optimized + warmup_cosine + eval/早停 默认值（可用环境变量覆盖）。
+# -----------------------------------------------------------------------------
+# 兼容入口（推荐后续收敛至）：bash scripts/train_ddp.sh — 见 docs/D4C_RUNTIME_SPEC.md
+# -----------------------------------------------------------------------------
+# run_step5_optimized.sh — Step 5 正式入口：主训练与评估（DDP：torchrun + run-d4c.py）
+# checkpoint 根目录为 step3_optimized/，日志默认 step5_optimized/；
+# torchrun 前注入与 Step 3 一致的 eval/早停等环境默认值（可用环境变量覆盖）。
 #
 # 用法: bash run_step5_optimized.sh --task N --step3-subdir step3_opt_YYYYMMDD_HHMM [选项…]
 #       --step3-subdir 须对应 checkpoints/<N>/step3_optimized/<该目录>/（通常由 run_step3_optimized.sh 生成）
@@ -22,6 +25,10 @@
 # 日志：默认 log/<task>/step5_optimized/runs/<时间戳>/train.log（D4C_LOG_GROUP=step5_optimized）
 #
 # ---------------------------------------------------------------------------
+# D4C_TRAIN_PRESET：未设置时默认为 step5（与 step3 超参相同，见 presets/training/step5.yaml）
+# 可选 runtime 预设（与 config.RUNTIME_PRESETS 一致，见 run_step3_optimized.sh 顶部说明）：
+#   单卡 export D4C_RUNTIME_PRESET=gpu01_single_12c
+#   双卡 export D4C_RUNTIME_PRESET=gpu01_ddp2_12c
 
 set -e
 SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,9 +41,8 @@ export HF_EVALUATE_OFFLINE="${HF_EVALUATE_OFFLINE:-1}"
 LOG_DIR="$D4C_ROOT/log"
 mkdir -p "$LOG_DIR"
 
-# ---- optimized 默认（与 run_step3_optimized.sh / config 一致；可被环境变量或 CLI 覆盖）----
+# ---- 默认（与 run_step3_optimized.sh / config 一致；可被环境变量或 CLI 覆盖）----
 # 未 export D4C_FULL_EVAL_EVERY 时不传 --full-eval-every，由 Python 使用分阶段 full BLEU 默认
-export D4C_TRAIN_MODE=optimized
 export D4C_LR_SCHEDULER="${D4C_LR_SCHEDULER:-warmup_cosine}"
 export D4C_WARMUP_RATIO="${D4C_WARMUP_RATIO:-0.05}"
 export D4C_QUICK_EVAL_MAX_SAMPLES="${D4C_QUICK_EVAL_MAX_SAMPLES:-512}"
@@ -44,6 +50,7 @@ export TRAIN_EARLY_STOP_PATIENCE_FULL="${TRAIN_EARLY_STOP_PATIENCE_FULL:-4}"
 export TRAIN_MIN_EPOCHS="${TRAIN_MIN_EPOCHS:-8}"
 export TRAIN_EARLY_STOP_PATIENCE="${TRAIN_EARLY_STOP_PATIENCE:-6}"
 export TRAIN_BLEU4_MAX_SAMPLES="${TRAIN_BLEU4_MAX_SAMPLES:-512}"
+export D4C_TRAIN_PRESET="${D4C_TRAIN_PRESET:-step5}"
 
 d4c_run_log_dir() {
     python -c "from paths_config import get_log_task_dir; import os; print(get_log_task_dir($1))"
@@ -93,17 +100,7 @@ EPOCHS=""
 NUM_PROC=""
 
 get_task_params() {
-    case $1 in
-        1) echo "AM_Electronics AM_CDs 5e-4 1 1e-3" ;;
-        2) echo "AM_Movies AM_CDs 1e-3 0.1 1e-3" ;;
-        3) echo "AM_CDs AM_Electronics 5e-4 0.5 1e-3" ;;
-        4) echo "AM_Movies AM_Electronics 1e-3 0.5 1e-3" ;;
-        5) echo "AM_CDs AM_Movies 1e-3 0.5 1e-3" ;;
-        6) echo "AM_Electronics AM_Movies 1e-3 0.5 1e-3" ;;
-        7) echo "Yelp TripAdvisor 1e-4 0.5 1e-3" ;;
-        8) echo "TripAdvisor Yelp 5e-4 1 1e-3" ;;
-        *) echo "" ;;
-    esac
+    python -c "from config import TASK_DEFAULTS; import sys; t=int(sys.argv[1]); c=TASK_DEFAULTS[t]; sys.stdout.write('{} {} {} {} {}'.format(c['auxiliary'], c['target'], c['lr'], c['coef'], c['adv'])); sys.exit(0)" "$1"
 }
 
 TASK_ID=""
@@ -115,7 +112,7 @@ NEST_SUB_NAME=""
 prev=""
 for i in "$@"; do
     if [ "$i" = "--all" ]; then
-        echo "错误: Step 5 已取消 --all（仅嵌套模式）。请逐任务: --task N --step3-subdir step3_opt_…"
+        echo "错误: Step 5 已取消 --all（仅嵌套模式）。请逐任务: --task N --step3-subdir step3_opt_<时间戳>"
         exit 1
     elif [ "$i" = "--eval-only" ]; then EVAL_ONLY=1
     elif [ "$i" = "--train-only" ]; then TRAIN_ONLY=1
@@ -133,6 +130,9 @@ for i in "$@"; do
     elif [ "$prev" = "--step3-subdir" ]; then STEP3_SUBDIR_FOR_NEST="$i"; prev=""
     elif [ "$i" = "--nested-subdir" ]; then prev="--nested-subdir"
     elif [ "$prev" = "--nested-subdir" ]; then NEST_SUB_NAME="$i"; prev=""
+    elif [ "$i" = "--gpus" ] || [[ "$i" == --gpus=* ]]; then
+        echo "错误: --gpus has been removed. 请使用 CUDA_VISIBLE_DEVICES 与 DDP_NPROC / --ddp-nproc。" >&2
+        exit 2
     elif [ "$i" = "--daemon" ] || [ "$i" = "--bg" ]; then DAEMON=1
     fi
 done
@@ -223,11 +223,11 @@ fi
 
 export D4C_CHECKPOINT_GROUP=step3_optimized
 export D4C_CHECKPOINT_SUBDIR="${STEP3_SUBDIR_FOR_NEST}/step5/$_inner"
-# 主日志：log/<task>/step5_optimized/…（与论文复现 step5 区分）
+# 主日志：log/<task>/step5_optimized/…（与默认 step5 日志/checkpoint 布局区分）
 if [ -z "${D4C_LOG_GROUP:-}" ] && [ -z "${D4C_LOG_SUBDIR:-}" ] && [ -z "${D4C_LOG_STEP:-}" ]; then
     export D4C_LOG_GROUP=step5_optimized
 fi
-echo "Step 5（optimized）checkpoint: $NEST_DIR （GROUP=step3_optimized SUBDIR=$D4C_CHECKPOINT_SUBDIR）"
+echo "Step 5 checkpoint: $NEST_DIR （GROUP=step3_optimized SUBDIR=$D4C_CHECKPOINT_SUBDIR）"
 if [ -n "${D4C_LOG_GROUP:-}" ]; then
     echo "Step 5 主日志根（LOG_GROUP）: $D4C_ROOT/log/$TASK_ID/$D4C_LOG_GROUP/"
 fi
@@ -246,7 +246,7 @@ if [ -n "$DAEMON" ] && [ -z "${INTERNAL_NOHUP:-}" ]; then
     done
     ABS_TRAIN="$(readlink -f "$LOGFILE" 2>/dev/null || echo "$LOGFILE")"
     ABS_NOHUP="$(readlink -f "$NOHUP_OUT" 2>/dev/null || echo "$NOHUP_OUT")"
-    echo "已在后台启动 Step 5 optimized（DDP）"
+    echo "已在后台启动 Step 5（DDP）"
     echo "  Python 日志 (--log_file): $ABS_TRAIN"
     echo "  nohup 终端输出: $ABS_NOHUP"
     echo "查看训练日志: tail -f $ABS_TRAIN"
@@ -275,11 +275,11 @@ coef=$(echo "$p" | cut -d' ' -f4)
 eta=$(echo "$p" | cut -d' ' -f5)
 
 if [ -n "$EVAL_ONLY" ]; then
-    echo "========== Step 5 optimized DDP Task $TASK_ID 仅 eval (nproc=$DDP_NPROC): $aux -> $tgt =========="
+    echo "========== Step 5 DDP Task $TASK_ID 仅 eval (nproc=$DDP_NPROC): $aux -> $tgt =========="
 elif [ -n "$TRAIN_ONLY" ]; then
-    echo "========== Step 5 optimized DDP Task $TASK_ID 仅 train (nproc=$DDP_NPROC): $aux -> $tgt =========="
+    echo "========== Step 5 DDP Task $TASK_ID 仅 train (nproc=$DDP_NPROC): $aux -> $tgt =========="
 else
-    echo "========== Step 5 optimized DDP Task $TASK_ID (nproc=$DDP_NPROC): $aux -> $tgt =========="
+    echo "========== Step 5 DDP Task $TASK_ID (nproc=$DDP_NPROC): $aux -> $tgt =========="
 fi
 
 _EVAL_FLAG=""
@@ -288,11 +288,11 @@ _TRAIN_ONLY_FLAG=""
 [ -n "$TRAIN_ONLY" ] && _TRAIN_ONLY_FLAG="--train-only"
 
 if [ -n "$EVAL_ONLY" ]; then
-    echo "启动 Step 5 optimized（DDP）Task $TASK_ID【仅 eval】，日志: $LOGFILE"
+    echo "启动 Step 5（DDP）Task $TASK_ID【仅 eval】，日志: $LOGFILE"
 elif [ -n "$TRAIN_ONLY" ]; then
-    echo "启动 Step 5 optimized（DDP）Task $TASK_ID【仅 train】，日志: $LOGFILE"
+    echo "启动 Step 5（DDP）Task $TASK_ID【仅 train】，日志: $LOGFILE"
 else
-    echo "启动 Step 5 optimized（DDP）Task $TASK_ID，日志: $LOGFILE"
+    echo "启动 Step 5（DDP）Task $TASK_ID，日志: $LOGFILE"
 fi
 
 if [ -z "$BATCH_SIZE" ] && [ -z "$EVAL_ONLY" ]; then
@@ -315,7 +315,6 @@ fi
 ${TORCHRUN_BIN} --standalone --nproc_per_node="$DDP_NPROC" run-d4c.py \
     --auxiliary "$aux" --target "$tgt" $EPOCHS --learning_rate "$lr" --coef "$coef" --eta "$eta" \
     $BATCH_SIZE $NUM_PROC \
-    --train-mode optimized \
     --min-epochs "$TRAIN_MIN_EPOCHS" \
     --early-stop-patience "$TRAIN_EARLY_STOP_PATIENCE" \
     --early-stop-patience-full "$TRAIN_EARLY_STOP_PATIENCE_FULL" \
@@ -327,9 +326,9 @@ ${TORCHRUN_BIN} --standalone --nproc_per_node="$DDP_NPROC" run-d4c.py \
     --log_file "$LOGFILE"
 
 if [ -n "$EVAL_ONLY" ]; then
-    echo "========== Step 5 optimized（仅 eval）完成 =========="
+    echo "========== Step 5（仅 eval）完成 =========="
 elif [ -n "$TRAIN_ONLY" ]; then
-    echo "========== Step 5 optimized（仅 train）完成 =========="
+    echo "========== Step 5（仅 train）完成 =========="
 else
-    echo "========== Step 5 optimized 完成 =========="
+    echo "========== Step 5 完成 =========="
 fi

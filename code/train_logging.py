@@ -16,6 +16,10 @@
                                 （step3_/step5_ 前缀）；否则 <项目根>/log/eval。
                                 内含 eval_runs_all.{txt,jsonl,csv}
   每任务 eval 汇总：get_log_task_dir(task) 下的 eval/ 子目录内 eval_runs.{txt,jsonl,csv}（训练主日志在 runs/ 子目录，由 shell 约定）
+  D4C_STEP3_ALL_SHELL_LOG  （仅 shell）run_step3_optimized.sh --all 前台 tee 汇总路径；未设置时默认为 log/step3_optimized_all_<秒级时间戳>.log
+  D4C_LOG_SILENT_STDIO_WARN=1  关闭 setup_train_logging 对 stdout/stderr 与 --log_file 同路径的告警
+  D4C_DUAL_TRAIN_LOG=1       双文件：--log_file 为 train.log（细粒度：Step/Grad/Checkpoint/Timing/数据告警），
+                              另写同目录 nohup.log（RUN_*、epoch 块、DDP 心跳、性能汇总）。可用 D4C_SUMMARY_LOG 覆盖摘要路径。
 """
 from __future__ import annotations
 
@@ -24,14 +28,56 @@ import json
 import logging
 import os
 import random
+import re
 import string
+import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
-from paths_config import D4C_ROOT, get_log_task_dir
+from paths_config import get_d4c_root, get_log_task_dir
 
 LOGGER_NAME = "d4c"
 RUN_END_LINE = "========== RUN END =========="
+
+# 日志路由：双文件模式下 train.log 仅 detail+both，nohup.log 仅 summary+both；单文件无 Filter，等价于 both。
+ROUTE_DETAIL = "detail"
+ROUTE_SUMMARY = "summary"
+ROUTE_BOTH = "both"
+
+
+class _D4cRouteFilter(logging.Filter):
+    """仅放行 d4c_route 属于 allowed 或 both 的记录。"""
+
+    def __init__(self, allowed: FrozenSet[str]) -> None:
+        super().__init__()
+        self._allowed = allowed
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        r = getattr(record, "d4c_route", ROUTE_BOTH)
+        if r == ROUTE_BOTH:
+            return True
+        return r in self._allowed
+
+
+def _dual_log_enabled() -> bool:
+    v = os.environ.get("D4C_DUAL_TRAIN_LOG", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _summary_log_path(detail_path: str) -> str:
+    ex = os.environ.get("D4C_SUMMARY_LOG", "").strip()
+    if ex:
+        return os.path.abspath(os.path.expanduser(ex))
+    return os.path.join(os.path.dirname(os.path.abspath(detail_path)), "nohup.log")
+
+
+def _plain_route_visible(handler: logging.Handler, route: str) -> bool:
+    allowed = getattr(handler, "_d4c_routes_allowed", None)
+    if allowed is None:
+        return True
+    if route == ROUTE_BOTH:
+        return True
+    return route in allowed
 
 
 class _StreamSuppressFileOnlyFilter(logging.Filter):
@@ -48,7 +94,7 @@ def generate_run_id() -> str:
 
 
 def _log_dir() -> str:
-    return os.path.abspath(os.path.expanduser(os.environ.get("D4C_LOG_DIR") or os.path.join(D4C_ROOT, "logs")))
+    return os.path.abspath(os.path.expanduser(os.environ.get("D4C_LOG_DIR") or os.path.join(get_d4c_root(), "logs")))
 
 
 def create_run_paths(
@@ -120,6 +166,44 @@ def _structured_log_extra(logger: logging.Logger) -> Dict[str, Any]:
     return {}
 
 
+def log_route_extra(logger: logging.Logger, route: str) -> Dict[str, Any]:
+    """合并结构化控制台抑制与路由字段（供 train_diagnostics 等复用）。"""
+    e = _structured_log_extra(logger)
+    e["d4c_route"] = route
+    return e
+
+
+def _realpath_resolved(path: str) -> str:
+    try:
+        return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    except OSError:
+        return os.path.abspath(os.path.expanduser(path))
+
+
+def _warn_if_stdio_points_to_log_file(logger: logging.Logger, log_path: str) -> None:
+    """若 stdout/stderr 已重定向到与 log_path 同一文件，则告警（易导致双 fd 写 train.log 乱序）。"""
+    v = os.environ.get("D4C_LOG_SILENT_STDIO_WARN", "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return
+    target = _realpath_resolved(log_path)
+    for stream_name, stream in (("stdout", sys.stdout), ("stderr", sys.stderr)):
+        try:
+            if stream.isatty():
+                continue
+            nm = getattr(stream, "name", None)
+            if not isinstance(nm, str) or not nm or nm.startswith("<"):
+                continue
+            if _realpath_resolved(nm) == target:
+                logger.warning(
+                    "[D4C] %s 与 --log_file 解析为同一路径 (%s)，可能导致重复写入或乱序；"
+                    "请避免将终端重定向到 train.log，或关闭 D4C_LOG_CONSOLE。",
+                    stream_name,
+                    target,
+                )
+        except Exception:
+            pass
+
+
 def _json_safe_sorted_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     safe: Dict[str, Any] = {}
     for k in sorted(data.keys()):
@@ -163,6 +247,7 @@ def setup_train_logging(
     # rank0 且有日志路径时默认不挂 StreamHandler，避免与 FileHandler 双写同一文件（含 shell 重定向）
     want_stream = (rank != 0) or (not (rank == 0 and log_path)) or mirror
 
+    stream_handler: Optional[logging.StreamHandler] = None
     if want_stream:
         sh = logging.StreamHandler()
         sh.setFormatter(fmt)
@@ -173,17 +258,59 @@ def setup_train_logging(
         if rank == 0 and log_path:
             sh.addFilter(_StreamSuppressFileOnlyFilter())
         logger.addHandler(sh)
+        stream_handler = sh
 
+    summary_log_path: Optional[str] = None
+    dual_log = False
     if rank == 0 and log_path:
         d = os.path.dirname(os.path.abspath(log_path))
         if d:
             os.makedirs(d, exist_ok=True)
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setLevel(file_level)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+        use_dual = _dual_log_enabled()
+        sp: Optional[str] = _summary_log_path(log_path) if use_dual else None
+        if use_dual and sp and _realpath_resolved(sp) != _realpath_resolved(log_path):
+            dual_log = True
+            summary_log_path = sp
+            sd = os.path.dirname(os.path.abspath(sp))
+            if sd:
+                os.makedirs(sd, exist_ok=True)
+            allow_d: FrozenSet[str] = frozenset({ROUTE_DETAIL, ROUTE_BOTH})
+            allow_s: FrozenSet[str] = frozenset({ROUTE_SUMMARY, ROUTE_BOTH})
+            fh_d = logging.FileHandler(log_path, encoding="utf-8")
+            fh_d.setLevel(file_level)
+            fh_d.setFormatter(fmt)
+            fh_d._d4c_routes_allowed = allow_d  # type: ignore[attr-defined]
+            fh_d.addFilter(_D4cRouteFilter(allow_d))
+            logger.addHandler(fh_d)
+            fh_s = logging.FileHandler(sp, encoding="utf-8")
+            fh_s.setLevel(file_level)
+            fh_s.setFormatter(fmt)
+            fh_s._d4c_routes_allowed = allow_s  # type: ignore[attr-defined]
+            fh_s.addFilter(_D4cRouteFilter(allow_s))
+            logger.addHandler(fh_s)
+            if stream_handler is not None:
+                stream_handler.addFilter(_D4cRouteFilter(allow_s))
+            _warn_if_stdio_points_to_log_file(logger, log_path)
+        else:
+            if use_dual and sp and _realpath_resolved(sp) == _realpath_resolved(log_path):
+                logger.warning(
+                    "[D4C] D4C_DUAL_TRAIN_LOG=1 但摘要路径与主日志相同，已回退为单文件写入。"
+                )
+            fh = logging.FileHandler(log_path, encoding="utf-8")
+            fh.setLevel(file_level)
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+            _warn_if_stdio_points_to_log_file(logger, log_path)
 
-    return {"logger": logger, "run_id": run_id, "log_path": log_path, "rank": rank, "world_size": world_size}
+    return {
+        "logger": logger,
+        "run_id": run_id,
+        "log_path": log_path,
+        "rank": rank,
+        "world_size": world_size,
+        "summary_log_path": summary_log_path,
+        "dual_log": dual_log,
+    }
 
 
 def log_run_header(logger: logging.Logger, meta: Dict[str, Any]) -> None:
@@ -191,7 +318,7 @@ def log_run_header(logger: logging.Logger, meta: Dict[str, Any]) -> None:
     safe = _json_safe_sorted_dict(meta)
     pretty = _pretty_log_enabled()
     payload = json.dumps(safe, ensure_ascii=False, indent=2 if pretty else None)
-    extra = _structured_log_extra(logger)
+    extra = log_route_extra(logger, ROUTE_SUMMARY)
     if pretty:
         logger.info("RUN_META\n%s", payload, extra=extra)
     else:
@@ -209,7 +336,7 @@ def log_config_snapshot(
     safe = _json_safe_sorted_dict(trimmed)
     pretty = _pretty_log_enabled()
     payload = json.dumps(safe, ensure_ascii=False, indent=2 if pretty else None)
-    extra = _structured_log_extra(logger)
+    extra = log_route_extra(logger, ROUTE_SUMMARY)
     if pretty:
         logger.info("RUN_CONFIG\n%s", payload, extra=extra)
     else:
@@ -228,7 +355,7 @@ def log_run_snapshot(
     body = {"meta": _json_safe_sorted_dict(meta), "config": _json_safe_sorted_dict(trimmed)}
     pretty = _pretty_log_enabled()
     payload = json.dumps(body, ensure_ascii=False, indent=2 if pretty else None)
-    extra = _structured_log_extra(logger)
+    extra = log_route_extra(logger, ROUTE_SUMMARY)
     if pretty:
         logger.info("RUN_SNAPSHOT\n%s", payload, extra=extra)
     else:
@@ -313,8 +440,8 @@ def format_epoch_training_block(
 
 
 def log_epoch_training_block(logger: Optional[logging.Logger], text: str) -> None:
-    """写入 format_epoch_training_block 生成的多行块（文件 + rank0 控制台，无前缀）。"""
-    _write_plain_log_block(logger, text)
+    """写入 format_epoch_training_block 生成的多行块（双文件模式下写入 nohup 侧摘要）。"""
+    _write_plain_log_block(logger, text, route=ROUTE_SUMMARY)
 
 
 def format_final_results_lines(
@@ -355,41 +482,108 @@ def format_final_results_lines(
     return lines
 
 
-def _write_plain_log_block(logger: Optional[logging.Logger], text: str) -> None:
-    """写入多行纯文本（不经 Formatter）：对每个 Handler 各写一次（通常仅 FileHandler，无控制台镜像）。"""
+def _write_plain_log_block(
+    logger: Optional[logging.Logger],
+    text: str,
+    *,
+    route: str = ROUTE_BOTH,
+) -> None:
+    """写入多行纯文本（不经 Formatter）：按 d4c 路由写入对应 FileHandler / StreamHandler。"""
     if not text.endswith("\n"):
         text = text + "\n"
     if logger is None:
         print(text, end="", flush=True)
         return
     for h in logger.handlers:
-        if isinstance(h, logging.FileHandler):
+        # FileHandler 继承 StreamHandler；与 logger.info 一样走 Handler 锁，避免与 emit 交错
+        if isinstance(h, logging.StreamHandler) and _plain_route_visible(h, route):
             try:
-                h.stream.write(text)
-                h.flush()
-            except Exception:
-                pass
-        elif isinstance(h, logging.StreamHandler):
-            try:
-                h.stream.write(text)
-                h.flush()
+                h.acquire()
+                try:
+                    h.stream.write(text)
+                    h.flush()
+                finally:
+                    h.release()
             except Exception:
                 pass
 
 
 def log_final_results_block(logger: Optional[logging.Logger], lines: list) -> None:
-    """FINAL RESULTS 多行块（纯文本，无时间戳/级别前缀；默认仅文件，D4C_LOG_CONSOLE=1 时兼写控制台）。"""
+    """FINAL RESULTS 多行块（双文件模式下写入摘要侧）。"""
     text = "\n".join(lines)
-    _write_plain_log_block(logger, text)
+    _write_plain_log_block(logger, text, route=ROUTE_SUMMARY)
+
+
+def flush_preset_load_events(logger: Optional[logging.Logger]) -> None:
+    """将 import config 阶段记录的 presets YAML 加载结果刷入训练日志（摘要路由）。"""
+    if logger is None:
+        return
+    try:
+        import config as cfg
+
+        ev = getattr(cfg, "PRESET_LOAD_EVENTS", None) or []
+        for line in ev:
+            logger.info("[PresetYAML] %s", line, extra=log_route_extra(logger, ROUTE_SUMMARY))
+    except Exception:
+        pass
 
 
 def finalize_run_log(logger: Optional[logging.Logger], extra: Optional[str] = None) -> None:
-    _write_plain_log_block(logger, RUN_END_LINE + "\n")
+    _write_plain_log_block(logger, RUN_END_LINE + "\n", route=ROUTE_BOTH)
     if logger is not None:
         if extra:
-            logger.info("%s", extra)
+            logger.info("%s", extra, extra=log_route_extra(logger, ROUTE_BOTH))
     elif extra:
         print(extra, flush=True)
+
+
+# 误写入 train.log 的常见 shell 行（历史 bug 或手工重定向）
+_TRAIN_LOG_SHELL_MARKERS = (
+    "---------- Task ",
+    "========== 跳过 Task ",
+)
+_EPOCH_HEAD_LINE_RE = re.compile(r"^Epoch (\d+)\s*$")
+
+
+def audit_train_log_file(path: str) -> Dict[str, Any]:
+    """轻量自检（启发式）：是否混入 shell 包装行、Epoch 行序列是否严格递增 1。
+
+    适用于单次连续训练；同文件若含多段 train/eval，可能出现重复 Epoch 编号，结果仅供参考。
+    """
+    result: Dict[str, Any] = {
+        "path": path,
+        "shell_hits": [],
+        "epoch_numbers": [],
+        "epoch_sequence_gaps": [],
+    }
+    if not path or not os.path.isfile(path):
+        result["error"] = "not_a_file"
+        return result
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fp:
+            lines = fp.readlines()
+    except OSError as e:
+        result["error"] = str(e)
+        return result
+    for lineno, ln in enumerate(lines, 1):
+        for marker in _TRAIN_LOG_SHELL_MARKERS:
+            if marker in ln:
+                result["shell_hits"].append(
+                    {"line": lineno, "marker": marker, "snippet": ln.strip()[:160]}
+                )
+                break
+    for ln in lines:
+        m = _EPOCH_HEAD_LINE_RE.match(ln.strip())
+        if m:
+            result["epoch_numbers"].append(int(m.group(1)))
+    nums = result["epoch_numbers"]
+    if len(nums) >= 2:
+        for a, b in zip(nums, nums[1:]):
+            if b != a + 1:
+                result["epoch_sequence_gaps"].append({"after_epoch": a, "next_seen": b})
+    result["epoch_line_count"] = len(nums)
+    result["epoch_max"] = max(nums) if nums else None
+    return result
 
 
 def broadcast_run_paths_ddp(
@@ -455,18 +649,19 @@ def _global_eval_summary_dir() -> str:
     g = os.environ.get("D4C_EVAL_SUMMARY_GLOBAL_DIR", "").strip()
     if g:
         return os.path.abspath(os.path.expanduser(g))
+    _root = get_d4c_root()
     log_group = os.environ.get("D4C_LOG_GROUP", "").strip().lower()
     if log_group in ("step3", "step5"):
-        return os.path.join(D4C_ROOT, "log", log_group, _EVAL_SUMMARY_SUBDIR)
+        return os.path.join(_root, "log", log_group, _EVAL_SUMMARY_SUBDIR)
     group = os.environ.get("D4C_CHECKPOINT_GROUP", "").strip().lower()
     if group in ("step3", "step5"):
-        return os.path.join(D4C_ROOT, "log", group, _EVAL_SUMMARY_SUBDIR)
+        return os.path.join(_root, "log", group, _EVAL_SUMMARY_SUBDIR)
     sub = os.environ.get("D4C_CHECKPOINT_SUBDIR", "").strip().lower()
     if sub.startswith("step3_"):
-        return os.path.join(D4C_ROOT, "log", "step3", _EVAL_SUMMARY_SUBDIR)
+        return os.path.join(_root, "log", "step3", _EVAL_SUMMARY_SUBDIR)
     if sub.startswith("step5_"):
-        return os.path.join(D4C_ROOT, "log", "step5", _EVAL_SUMMARY_SUBDIR)
-    return os.path.join(D4C_ROOT, "log", _EVAL_SUMMARY_SUBDIR)
+        return os.path.join(_root, "log", "step5", _EVAL_SUMMARY_SUBDIR)
+    return os.path.join(_root, "log", _EVAL_SUMMARY_SUBDIR)
 
 
 def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, float]:

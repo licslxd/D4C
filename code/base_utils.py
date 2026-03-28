@@ -78,9 +78,7 @@ import math
 
 
 def get_underlying_model(model):
-    """当 model 被 DataParallel / DistributedDataParallel 包装时返回原始模块。"""
-    if isinstance(model, nn.DataParallel):
-        return model.module
+    """当 model 被 DistributedDataParallel 包装时返回原始模块。"""
     if isinstance(model, nn.parallel.DistributedDataParallel):
         return model.module
     return model

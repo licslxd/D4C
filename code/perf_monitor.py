@@ -373,7 +373,13 @@ class PerfMonitor:
         )
         if self._logger is not None:
             self._logger.debug(block + "\n")
-            self._logger.info(one)
+            try:
+                from train_logging import ROUTE_SUMMARY, log_route_extra
+
+                _ex = log_route_extra(self._logger, ROUTE_SUMMARY)
+            except Exception:
+                _ex = {}
+            self._logger.info(one, extra=_ex)
         else:
             print(block, flush=True)
             append_log_dual(self.log_file, block + "\n")
@@ -428,7 +434,13 @@ class PerfMonitor:
         ]
         out = "\n".join(lines)
         if self._logger is not None:
-            self._logger.info(out)
+            try:
+                from train_logging import ROUTE_SUMMARY, log_route_extra
+
+                _ex = log_route_extra(self._logger, ROUTE_SUMMARY)
+            except Exception:
+                _ex = {}
+            self._logger.info(out, extra=_ex)
         else:
             print(out, flush=True)
             append_log_dual(self.log_file, out + "\n")

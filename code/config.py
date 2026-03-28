@@ -1,13 +1,16 @@
 import math
 import os
+import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass
+from pathlib import Path
+from dataclasses import asdict, dataclass, replace
 from typing import (
     Any,
-    Callable,
     Dict,
     FrozenSet,
+    List,
     Optional,
+    Set,
     Tuple,
     TypedDict,
     TypeVar,
@@ -15,6 +18,18 @@ from typing import (
 )
 
 from cpu_utils import effective_cpu_count
+from training_runtime_inputs import collect_training_runtime_overrides_from_args
+
+# 执行层：DDP_NPROC / torchrun --nproc_per_node 仅在 shell 解析；Python 以 WORLD_SIZE 为准。
+# D4C_NUM_PROC 为 CPU 侧（如 datasets.map）并行度，属 runtime 链，勿与 DDP_NPROC 混淆。详见 docs/D4C_RUNTIME_SPEC.md。
+
+# import 后由 train_logging.flush_preset_load_events 写入训练日志（摘要侧）
+PRESET_LOAD_EVENTS: List[str] = []
+
+
+def record_preset_event(msg: str) -> None:
+    PRESET_LOAD_EVENTS.append(msg)
+
 
 # ---------------------------------------------------------------------------
 # 类型与轻量配置对象（供静态检查与逐步向「入口 resolve、后续只读」演进）
@@ -29,6 +44,20 @@ class TaskConfig(TypedDict):
     lr: Union[int, float]
     coef: Union[int, float]
     adv: Union[int, float]
+
+
+class RuntimePresetRow(TypedDict, total=False):
+    """命名 runtime 预设（CPU / DataLoader 并发）；与训练 TRAINING_PRESETS 独立。"""
+
+    max_parallel_cpu: int
+    num_proc: int
+    dataloader_num_workers_train: int
+    dataloader_num_workers_valid: int
+    dataloader_num_workers_test: int
+    dataloader_prefetch_factor_train: int
+    dataloader_prefetch_factor_valid: int
+    dataloader_prefetch_factor_test: int
+    dataloader_workers_train_per_rank_cap: int
 
 
 class TrainingPresetRow(TypedDict, total=False):
@@ -46,68 +75,39 @@ class TrainingPresetRow(TypedDict, total=False):
 
 
 @dataclass(frozen=True)
-class ResolvedTrainingConfig:
+class BaseTrainingDefaults:
     """
-    不含 CLI 的只读快照：由当前环境变量 + 命名预设 + 模块默认解析。
-    训练脚本仍应在入口用「CLI 非 None 则覆盖」；本对象便于日志与调试统一打印。
+    训练相关**代码默认**的单一来源（不含 task 表、不含 preset、不在 import 时读 ENV）。
+
+    解析链目标形态：BASE_TRAINING_DEFAULTS → ENV / 命名预设 / CLI → 解析结果。
     """
 
-    task_idx: Optional[int]
-    global_train_batch_size: int
-    epochs: int
-    min_lr_ratio: float
-    full_eval_every_epochs_uniform: int
+    epochs: int = 50
+    train_batch_size: int = 2048
+    gradient_accumulation_steps: int = 1
+    min_lr_ratio: float = 0.1
+    train_min_epochs: int = 8
+    train_early_stop_patience: int = 6
+    train_bleu4_max_samples: int = 512
+    lr_scheduler: str = "warmup_cosine"
+    warmup_epochs: float = 1.0
+    # eval 全局 batch 代码默认；运行时仍优先读 EVAL_BATCH_SIZE
+    eval_batch_size: int = 2560
+    # 无任务 lr 时 learning_rate resolve 链末级 fallback（在 build_resolved_training_config 内使用）
+    initial_learning_rate: float = 1e-3
+
+
+BASE_TRAINING_DEFAULTS = BaseTrainingDefaults()
+DEFAULT_TRAINING_CONFIG = BASE_TRAINING_DEFAULTS
+"""与 BASE_TRAINING_DEFAULTS 同义别名，便于语义上称「默认训练配置」。"""
+
+# 历史兼容：与 ``from config import train_batch_size`` / ``epochs`` 等保持一致（值均来自 BASE_TRAINING_DEFAULTS）
+train_batch_size = BASE_TRAINING_DEFAULTS.train_batch_size
+gradient_accumulation_steps = BASE_TRAINING_DEFAULTS.gradient_accumulation_steps
+epochs = BASE_TRAINING_DEFAULTS.epochs
 
 
 T = TypeVar("T")
-
-
-def _training_resolve_value(
-    *,
-    cli: Optional[T],
-    env_names: Tuple[str, ...],
-    env_reader: Optional[Callable[[str], T]] = None,
-    task_idx: Optional[int],
-    preset_key: str,
-    code_default: T,
-    preset_reader: Optional[Callable[[Any], T]] = None,
-    after_preset: Optional[Callable[[T], T]] = None,
-) -> T:
-    """
-    统一优先级（在 config 层可见部分）：CLI > ENV（按 env_names 顺序）> TRAINING_PRESET 切片 > 代码默认。
-
-    说明：各训练脚本的 CLI 参数在 parse 后若需覆盖，由调用方传入 cli；本模块多数 getter 不含 CLI，
-    则 cli 恒为 None，退化为 ENV > preset > code。
-    """
-    if cli is not None:
-        return cli  # type: ignore[return-value]
-    for name in env_names:
-        if name in os.environ:
-            raw = os.environ[name]
-            if env_reader is not None:
-                v = env_reader(raw)
-            else:
-                raise RuntimeError(f"env_reader 未提供但存在环境变量 {name}")
-            return v
-    row = _active_train_preset_slice(task_idx)
-    if row and preset_key in row:
-        raw = row[preset_key]
-        if preset_reader is not None:
-            v = preset_reader(raw)
-        else:
-            v = raw  # type: ignore[assignment]
-        if after_preset is not None:
-            v = after_preset(v)
-        return v  # type: ignore[return-value]
-    return code_default
-
-
-def _read_env_float(name: str) -> float:
-    return float(os.environ[name])
-
-
-def _read_env_int(name: str) -> int:
-    return int(os.environ[name])
 
 
 def _preset_int_min(raw: Any, minimum: int) -> int:
@@ -123,150 +123,187 @@ def _coerce_task_param_numeric(v: Any) -> Union[int, float]:
 
 
 # ---------------------------------------------------------------------------
-# 训练模式（reproduction / optimized）
+# presets/*.yaml：优先加载（相对仓库根 presets/）；缺失、错误或缺 PyYAML 时回退下方内置表
 # ---------------------------------------------------------------------------
 
 
-def _normalized_train_mode() -> str:
-    """
-    训练工程模式（运行时读取环境变量，便于 CLI 在 parse_args 后写入 D4C_TRAIN_MODE）。
-    - reproduction / repro / paper / default：论文复现取向（默认）。
-    - optimized：大 batch / DDP 工程优化取向，非严格复现。
-    """
-    m = os.environ.get("D4C_TRAIN_MODE", "reproduction").strip().lower()
-    if m in ("reproduction", "repro", "paper", "default"):
-        return "reproduction"
-    if m == "optimized":
-        return "optimized"
-    return "reproduction"
+def _d4c_presets_repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
 
 
-def get_train_mode() -> str:
-    return _normalized_train_mode()
+def _load_yaml_file(path: Path) -> Any:
+    import yaml
+
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-def get_exact_reproduction() -> bool:
-    return get_train_mode() == "reproduction"
+_TASK_ROW_KEYS: FrozenSet[str] = frozenset({"auxiliary", "target", "lr", "coef", "adv"})
 
 
-def get_allow_large_batch() -> bool:
-    """optimized 模式下语义上允许更大 global batch（实际 batch 仍由 CLI/config 决定）。"""
-    return get_train_mode() == "optimized"
+def _normalize_task_row_yaml(v: Any, *, ctx: str) -> TaskConfig:
+    if not isinstance(v, dict):
+        raise TypeError(f"{ctx} 须为 dict，当前为 {type(v).__name__}")
+    unk = set(v.keys()) - _TASK_ROW_KEYS
+    if unk:
+        raise ValueError(f"{ctx} 含有未知字段 {sorted(unk)}")
+    miss = _TASK_ROW_KEYS - set(v.keys())
+    if miss:
+        raise ValueError(f"{ctx} 缺少字段 {sorted(miss)}")
+    return {
+        "auxiliary": str(v["auxiliary"]),
+        "target": str(v["target"]),
+        "lr": _coerce_task_param_numeric(v["lr"]),
+        "coef": _coerce_task_param_numeric(v["coef"]),
+        "adv": _coerce_task_param_numeric(v["adv"]),
+    }
 
 
-def _env_int_choice(name: str, repro_default: int, opt_default: int) -> int:
-    if name in os.environ:
-        return max(1, int(os.environ[name]))
-    return opt_default if get_train_mode() == "optimized" else repro_default
-
-
-def get_lr_scheduler_type() -> str:
-    """
-    none：保持 valid 变差时手工减半学习率（原行为）。
-    warmup_cosine：按步数 warmup + cosine（与手工减半互斥，由训练循环实现）。
-    未设置环境变量时：reproduction 为 none；optimized 默认为 warmup_cosine。
-    """
-    if "D4C_LR_SCHEDULER" in os.environ:
-        v = os.environ["D4C_LR_SCHEDULER"].strip().lower()
-        if v in ("none", "off", "disabled"):
-            return "none"
-        if v in ("warmup_cosine", "warmup-cosine", "cosine"):
-            return "warmup_cosine"
-        return "none"
-    return "warmup_cosine" if get_train_mode() == "optimized" else "none"
-
-
-def get_warmup_epochs() -> float:
-    """未指定 D4C_WARMUP_STEPS / D4C_WARMUP_RATIO 时，用 epoch 数换算 warmup steps（兼容旧配置）。"""
-    return float(os.environ.get("D4C_WARMUP_EPOCHS", "1.0"))
-
-
-def get_d4c_warmup_steps_optional() -> Optional[int]:
-    """显式 warmup 步数；未设置环境变量则 None。D4C_WARMUP_STEPS 优先于 D4C_WARMUP_RATIO。"""
-    if "D4C_WARMUP_STEPS" not in os.environ:
+def _try_load_task_defaults_from_yaml() -> Optional[Dict[int, TaskConfig]]:
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        record_preset_event("WARN presets/tasks: PyYAML not installed -> builtin task_configs")
+        warnings.warn(
+            "未安装 PyYAML，跳过 presets/tasks/*.yaml，使用内置 task_configs / TASK_DEFAULTS。",
+            UserWarning,
+            stacklevel=2,
+        )
         return None
-    v = int(os.environ["D4C_WARMUP_STEPS"])
-    return v if v > 0 else None
-
-
-def get_d4c_warmup_ratio_optional() -> Optional[float]:
-    """显式 warmup 占计划总步数比例；未设置则 None。"""
-    if "D4C_WARMUP_RATIO" not in os.environ:
+    root = _d4c_presets_repo_root() / "presets" / "tasks"
+    if not root.is_dir():
+        record_preset_event("SKIP presets/tasks: directory missing -> builtin task_configs")
         return None
-    return float(os.environ["D4C_WARMUP_RATIO"])
-
-
-def get_min_lr_ratio(task_idx: Optional[int] = None) -> float:
-    """
-    cosine 末端倍率下限（相对 initial_lr）。
-    - reproduction：模块默认 0.0（可衰减到底，贴近旧论文行为）
-    - optimized：模块默认 0.1（生成/解释任务末端保留一定步长，减轻 lr 过小导致欠拟合）
-    命名预设 / D4C_MIN_LR_RATIO 仍优先于上述默认。
-    """
-    _default = 0.1 if get_train_mode() == "optimized" else 0.0
-    return _training_resolve_value(
-        cli=None,
-        env_names=("D4C_MIN_LR_RATIO",),
-        env_reader=_read_env_float,
-        task_idx=task_idx,
-        preset_key="min_lr_ratio",
-        code_default=_default,
-        preset_reader=float,
-    )
-
-
-def get_scheduler_initial_lr(cli_learning_rate: float) -> float:
-    """优化器使用的初始 LR；D4C_INITIAL_LR 优先于 CLI --learning_rate。"""
-    if "D4C_INITIAL_LR" in os.environ:
-        return float(os.environ["D4C_INITIAL_LR"])
-    return float(cli_learning_rate)
-
-
-def _full_eval_uniform_interval_from_env() -> Optional[int]:
-    """若设置了固定间隔环境变量则返回 N（>=0），否则 None。"""
-    if "D4C_FULL_EVAL_EVERY" in os.environ:
-        return max(0, int(os.environ["D4C_FULL_EVAL_EVERY"]))
-    if "D4C_FULL_BLEU_EVAL_EVERY" in os.environ:
-        return max(0, int(os.environ["D4C_FULL_BLEU_EVAL_EVERY"]))
-    return None
-
-
-def _full_eval_uniform_interval_from_preset(task_idx: Optional[int]) -> Optional[int]:
-    """命名预设中的固定 full eval 间隔；无键返回 None（与旧逻辑一致）。"""
-    row = _active_train_preset_slice(task_idx)
-    if not row or "full_eval_every_epochs" not in row:
+    paths = sorted(root.glob("*.yaml")) + sorted(root.glob("*.yml"))
+    if not paths:
+        record_preset_event("SKIP presets/tasks: no yaml files -> builtin task_configs")
         return None
-    return max(0, int(row["full_eval_every_epochs"]))
-
-
-def get_full_eval_every_epochs(task_idx: Optional[int] = None) -> int:
-    """
-    固定间隔：仅当设置了 D4C_FULL_EVAL_EVERY 或 D4C_FULL_BLEU_EVAL_EVERY 时返回 N；否则为 0。
-    optimized 且未设上述变量时，训练入口应改用 resolve_full_bleu_eval_training() 得到分阶段 schedule。
-    """
-    v = _full_eval_uniform_interval_from_env()
-    if v is not None:
-        return v
-    u = _full_eval_uniform_interval_from_preset(task_idx)
-    if u is not None:
-        return u
-    return 0
-
-
-def get_full_eval_phased_schedule_default() -> Optional[Tuple[int, int, int]]:
-    """
-    optimized 且未设置 D4C_FULL_EVAL_* 固定间隔时启用分阶段 full BLEU：
-    epoch<=boundary 每 early 轮一次；epoch>boundary 每 late 轮一次（默认 5 / 10 / 2）。
-    可用 D4C_FULL_EVAL_EARLY_EVERY、D4C_FULL_EVAL_PHASE_END_EPOCH、D4C_FULL_EVAL_LATE_EVERY 覆盖。
-    """
-    if get_train_mode() != "optimized":
+    merged: Dict[int, TaskConfig] = {}
+    for path in paths:
+        try:
+            raw = _load_yaml_file(path)
+            if not isinstance(raw, dict):
+                raise TypeError(f"根须为 mapping，当前为 {type(raw).__name__}")
+            for k, v in raw.items():
+                tid = int(k)
+                if tid < 1 or tid > 8:
+                    raise ValueError(f"任务号须在 1..8，收到 {tid!r}（键 {k!r}）")
+                merged[tid] = _normalize_task_row_yaml(v, ctx=f"{path.name} task {tid}")
+        except Exception as e:
+            record_preset_event(f"WARN presets/tasks: load failed {path} -> builtin ({e})")
+            warnings.warn(
+                f"加载 tasks YAML 失败，回退内置 task_configs: {path}: {e}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
+    need = set(range(1, 9))
+    if set(merged.keys()) != need:
+        record_preset_event(
+            f"WARN presets/tasks: keys must be 1..8, got {sorted(merged.keys())} -> builtin"
+        )
+        warnings.warn(
+            f"presets/tasks 合并后须恰好包含任务 1..8，当前键为 {sorted(merged.keys())}，回退内置。",
+            UserWarning,
+            stacklevel=2,
+        )
         return None
-    if _full_eval_uniform_interval_from_env() is not None:
+    record_preset_event(f"OK presets/tasks: loaded {len(paths)} yaml file(s)")
+    return merged
+
+
+def _coerce_training_preset_top_level(data: Dict[Any, Any]) -> Any:
+    keys = list(data.keys())
+    if not keys:
+        return data
+    if all(isinstance(k, int) and 1 <= k <= 8 for k in keys):
+        return {int(k): dict(v) if isinstance(v, dict) else v for k, v in data.items()}
+    if all(isinstance(k, str) and k.isdigit() and 1 <= int(k) <= 8 for k in keys):
+        return {int(k): dict(v) if isinstance(v, dict) else v for k, v in data.items()}
+    return dict(data)
+
+
+def _try_load_training_presets_from_yaml() -> Optional[Dict[str, Any]]:
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        record_preset_event("WARN presets/training: PyYAML not installed -> builtin TRAINING_PRESETS")
+        warnings.warn(
+            "未安装 PyYAML，跳过 presets/training/*.yaml，使用内置 TRAINING_PRESETS。",
+            UserWarning,
+            stacklevel=2,
+        )
         return None
-    early = max(1, int(os.environ.get("D4C_FULL_EVAL_EARLY_EVERY", "5")))
-    boundary = max(1, int(os.environ.get("D4C_FULL_EVAL_PHASE_END_EPOCH", "10")))
-    late = max(1, int(os.environ.get("D4C_FULL_EVAL_LATE_EVERY", "2")))
-    return (early, boundary, late)
+    root = _d4c_presets_repo_root() / "presets" / "training"
+    if not root.is_dir():
+        record_preset_event("SKIP presets/training: directory missing -> builtin TRAINING_PRESETS")
+        return None
+    paths = sorted(root.glob("*.yaml")) + sorted(root.glob("*.yml"))
+    if not paths:
+        record_preset_event("SKIP presets/training: no yaml files -> builtin TRAINING_PRESETS")
+        return None
+    out: Dict[str, Any] = {}
+    for path in paths:
+        try:
+            raw = _load_yaml_file(path)
+            if raw is None:
+                raise ValueError("文件为空或仅注释")
+            if not isinstance(raw, dict):
+                raise TypeError(f"根须为 mapping，当前为 {type(raw).__name__}")
+            out[path.stem] = _coerce_training_preset_top_level(raw)
+        except Exception as e:
+            record_preset_event(f"WARN presets/training: load failed {path} -> builtin ({e})")
+            warnings.warn(
+                f"加载训练预设 YAML 失败，回退内置 TRAINING_PRESETS: {path}: {e}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
+    record_preset_event(f"OK presets/training: loaded {len(paths)} preset file(s)")
+    return out
+
+
+def _try_load_runtime_presets_from_yaml() -> Optional[Dict[str, Dict[str, int]]]:
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        record_preset_event("WARN presets/runtime: PyYAML not installed -> builtin RUNTIME_PRESETS")
+        warnings.warn(
+            "未安装 PyYAML，跳过 presets/runtime/*.yaml，使用内置 RUNTIME_PRESETS。",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    root = _d4c_presets_repo_root() / "presets" / "runtime"
+    if not root.is_dir():
+        record_preset_event("SKIP presets/runtime: directory missing -> builtin RUNTIME_PRESETS")
+        return None
+    paths = sorted(root.glob("*.yaml")) + sorted(root.glob("*.yml"))
+    if not paths:
+        record_preset_event("SKIP presets/runtime: no yaml files -> builtin RUNTIME_PRESETS")
+        return None
+    out: Dict[str, Dict[str, int]] = {}
+    for path in paths:
+        try:
+            raw = _load_yaml_file(path)
+            if raw is None:
+                raise ValueError("文件为空或仅注释")
+            if not isinstance(raw, dict):
+                raise TypeError(f"根须为 mapping，当前为 {type(raw).__name__}")
+            row: Dict[str, int] = {}
+            for kk, vv in raw.items():
+                row[str(kk)] = int(vv)
+            out[path.stem] = row
+        except Exception as e:
+            record_preset_event(f"WARN presets/runtime: load failed {path} -> builtin ({e})")
+            warnings.warn(
+                f"加载 runtime 预设 YAML 失败，回退内置 RUNTIME_PRESETS: {path}: {e}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
+    record_preset_event(f"OK presets/runtime: loaded {len(paths)} preset file(s)")
+    return out
 
 
 def should_run_full_bleu_eval_epoch(
@@ -286,63 +323,13 @@ def should_run_full_bleu_eval_epoch(
     return epoch_1_based % full_eval_every == 0
 
 
-def resolve_full_bleu_eval_training(
-    cli_full_eval_every: Optional[int],
-    *,
-    task_idx: Optional[int] = None,
-) -> Tuple[int, Optional[Tuple[int, int, int]]]:
+def apply_ddp_fast_torch_backends() -> bool:
     """
-    返回 (uniform_every, phased)。uniform_every>0 时每 N epoch 一次 full BLEU；phased 非 None 时忽略 uniform（应为 0）。
-    CLI 优先，其次环境变量固定间隔，再次命名预设（可按 task_idx），再次 optimized 分阶段默认。
-    """
-    if cli_full_eval_every is not None:
-        return max(0, int(cli_full_eval_every)), None
-    u = _full_eval_uniform_interval_from_env()
-    if u is not None:
-        return u, None
-    u = _full_eval_uniform_interval_from_preset(task_idx)
-    if u is not None:
-        return u, None
-    phased = get_full_eval_phased_schedule_default()
-    if phased is not None:
-        return 0, phased
-    return 0, None
-
-
-def get_full_bleu_eval_every_epochs(task_idx: Optional[int] = None) -> int:
-    """与 get_full_eval_every_epochs(task_idx) 同义（兼容旧名）；支持 per-task 预设与 D4C_PRESET_TASK_ID。"""
-    return get_full_eval_every_epochs(task_idx)
-
-
-def snapshot_resolved_training_config(task_idx: Optional[int] = None) -> ResolvedTrainingConfig:
-    """当前 ENV + 命名预设 + 模块默认下的只读快照（不含 CLI）。"""
-    return ResolvedTrainingConfig(
-        task_idx=task_idx,
-        global_train_batch_size=get_train_batch_size(task_idx),
-        epochs=get_epochs(task_idx),
-        min_lr_ratio=get_min_lr_ratio(task_idx),
-        full_eval_every_epochs_uniform=get_full_eval_every_epochs(task_idx),
-    )
-
-
-def get_quick_eval_max_samples(resolved_bleu4_max_samples: int) -> int:
-    """
-    quick eval 子集大小（每 epoch）。D4C_QUICK_EVAL_MAX_SAMPLES 优先；否则用 TRAIN_BLEU4 / CLI 解析结果 resolved_bleu4_max_samples。
-    """
-    if "D4C_QUICK_EVAL_MAX_SAMPLES" in os.environ:
-        return max(64, int(os.environ["D4C_QUICK_EVAL_MAX_SAMPLES"]))
-    return max(64, int(resolved_bleu4_max_samples))
-
-
-def apply_optimized_torch_backends() -> bool:
-    """
-    optimized 且未禁用 D4C_DDP_FAST 时启用 TF32、cudnn.benchmark（加速，数值与论文不完全一致）。
+    D4C_DDP_FAST 未禁用时在 CUDA 上启用 TF32、cudnn.benchmark（加速，数值可能因硬件略有差异）。
     须在 CUDA 可用且尽量在 set_device 之后调用。
     """
     import torch
 
-    if get_train_mode() != "optimized":
-        return False
     v = os.environ.get("D4C_DDP_FAST", "1").strip().lower()
     if v in ("0", "false", "no", "off"):
         return False
@@ -363,37 +350,41 @@ def apply_optimized_torch_backends() -> bool:
 embed_batch_size = 1024  # compute_embeddings 嵌入批次大小，显存不足时可减小（64/128），多卡可增大（512/1024）
 
 # 全局配置（CPU 并行）
-# 与作业实际可用核数对齐：优先 sched_getaffinity（ cgroup/cpuset 下常为 nproc ），非 Linux 则 os.cpu_count()
-# 也可 export RUNNING_CPU_COUNT=12 显式指定（与 shell `nproc` 一致）
-# 可通过 run_step3/4/5.sh --num-proc N 或各 Python 脚本 --num-proc N 覆盖
-_num_cpu = effective_cpu_count()
-# 默认可并联上限：与常见单节点 GPU 作业「最多约 12 核」对齐；更大机器请 export MAX_PARALLEL_CPU=16 等
-_MAX_PARALLEL_CPU = max(1, int(os.environ.get("MAX_PARALLEL_CPU", "12")))
-# datasets.map（Tokenize）等并行进程数；与 PyTorch DataLoader 的 num_workers 独立，见 get_dataloader_num_workers()
-num_proc = min(_num_cpu, _MAX_PARALLEL_CPU)
+# 与作业实际可用核数对齐：优先 sched_getaffinity；不在 import 时冻结，见 _get_num_cpu() / get_num_proc()
+# 也可 export RUNNING_CPU_COUNT=12；更大机器请 export MAX_PARALLEL_CPU=16 等
+# runtime 解析链的代码默认上限（无 MAX_PARALLEL_CPU 且无 D4C_RUNTIME_PRESET 覆盖时与历史默认 12 一致）
+_RUNTIME_BASE_MAX_PARALLEL_CPU = 12
+
+
+def _get_num_cpu() -> int:
+    return int(effective_cpu_count() or 8)
+
+
+def _resolve_max_parallel_cpu_cli(max_parallel_cli: Optional[int] = None) -> int:
+    """runtime_base → runtime_preset → MAX_PARALLEL_CPU → 可选 CLI。"""
+    v = max(1, int(_RUNTIME_BASE_MAX_PARALLEL_CPU))
+    rp = _active_runtime_preset_slice()
+    if rp and "max_parallel_cpu" in rp:
+        v = max(1, int(rp["max_parallel_cpu"]))
+    if "MAX_PARALLEL_CPU" in os.environ:
+        v = max(1, int(os.environ["MAX_PARALLEL_CPU"]))
+    if max_parallel_cli is not None:
+        v = max(1, int(max_parallel_cli))
+    return v
+
+
+def _get_max_parallel_cpu() -> int:
+    return _resolve_max_parallel_cpu_cli(None)
 
 # 全局配置（Step 3/4/5 训练与推理）
-# 可通过 run_step3/4/5.sh --batch-size N 或各 Python 脚本 --batch-size N 覆盖 CLI；本模块侧为 ENV > 命名预设 > 下列默认值。
+# 代码默认已收敛至 BASE_TRAINING_DEFAULTS；本段仅说明语义与覆盖方式。
 #
-# train_batch_size（模块默认）：训练用「全局有效 batch」G——每个优化步在全体 rank 上合计的样本数。
-#   关系式：G = per_device_micro_batch × world_size × gradient_accumulation_steps
-#   其中 per_device_micro_batch 常记为 P（每 rank 每步 forward 的样本数，即 DataLoader batch_size）。
-train_batch_size = 2048  # 默认 G；显存不足时请配合梯度累积或 D4C_PER_DEVICE_BATCH_SIZE / per_device_train_batch_size 预设
-# 每优化步内累积多少个微批再 optimizer.step；1 表示不累积。亦可用 D4C_GRADIENT_ACCUMULATION_STEPS 或命名预设。
-gradient_accumulation_steps = 1
-# eval_batch_size：推理/验证用「全局 batch」（各 rank 合计）；DDP 下每 rank 批大小 = eval_batch_size / world_size
-eval_batch_size = int(os.environ.get("EVAL_BATCH_SIZE", "2560"))
-epochs = 50  # Step 3 域对抗预训练、Step 5 主训练的默认轮数（CLI > 预设 > 本值）
+# train_batch_size / epochs / gradient_accumulation_steps：见文件顶部别名与 get_*（CLI > ENV > 命名预设 > BASE）。
+#   G = per_device_micro_batch × world_size × gradient_accumulation_steps（P 即 DataLoader batch_size）。
+# eval 全局 batch：get_eval_batch_size() 运行时读 EVAL_BATCH_SIZE，未设则用 BASE_TRAINING_DEFAULTS.eval_batch_size。
+# 早停与 BLEU 采样默认值：BASE_TRAINING_DEFAULTS.train_min_epochs / train_early_stop_patience / train_bleu4_max_samples。
 
-# 早停与选模（可被 CLI 或环境变量覆盖；见 AdvTrain / run-d4c）
-# TRAIN_MIN_EPOCHS：至少训练多少 epoch 后才允许因 valid 变差而早停（reproduction 默认 30；optimized 默认 8）
-# TRAIN_EARLY_STOP_PATIENCE：valid 连续变差次数阈值（reproduction 默认 15；optimized 默认 6）
-# TRAIN_EARLY_STOP_PATIENCE_FULL：optimized 下按 full BLEU eval 次数计的早停耐心（未设则与 TRAIN_EARLY_STOP_PATIENCE 相同）
-# TRAIN_EARLY_STOP_PATIENCE_LOSS：dual_bleu 下仅针对 valid_loss 变差计数的早停耐心（未设 CLI 时见 resolve_early_stop_patience_loss）
-# TRAIN_BLEU4_MAX_SAMPLES：按 BLEU-4 选模时 quick 评估最多条数（reproduction 默认 2048；optimized 默认 512）
-# D4C_TRAIN_MODE=optimized 时若未设置上述环境变量，则采用 optimized 一侧默认值（见 getter）
-
-task_configs: Dict[int, TaskConfig] = {
+_TASK_CONFIGS_BUILTIN: Dict[int, TaskConfig] = {
     1: {
         "auxiliary": "AM_Electronics",
         "target": "AM_CDs",
@@ -452,6 +443,13 @@ task_configs: Dict[int, TaskConfig] = {
     },
 }
 
+task_configs: Dict[int, TaskConfig] = _TASK_CONFIGS_BUILTIN
+_LOADED_TASK_YAML = _try_load_task_defaults_from_yaml()
+if _LOADED_TASK_YAML is not None:
+    task_configs = _LOADED_TASK_YAML
+
+TASK_DEFAULTS: Dict[int, TaskConfig] = task_configs
+
 
 def resolve_task_idx_from_aux_target(auxiliary: str, target: str) -> Optional[int]:
     """由 auxiliary/target 反查任务号 1–8；未知组合返回 None。"""
@@ -470,15 +468,10 @@ def resolve_task_idx_from_aux_target(auxiliary: str, target: str) -> Optional[in
 #   1) 全局一条：顶层直接为字段 dict，如 {"train_batch_size": 1024, "epochs": 30, ...}，对所有任务相同。
 #   2) 按任务：顶层键为整数 1..8，值为该任务的字段 dict；各任务可分别改 batch / epochs / lr / coef / adv 等。
 #
-# 在「未通过 CLI / 环境变量显式覆盖」时，下列 getter 会采用当前任务对应切片：
-#   - 全局训练 batch（G）→ get_train_batch_size(task_idx)
-#   - gradient_accumulation_steps / per_device_train_batch_size → 见 get_* 与 resolve_ddp_train_microbatch_layout
-#   - epochs → get_epochs(task_idx)
-#   - full_eval_every_epochs → resolve_full_bleu_eval_training(..., task_idx=) / get_full_eval_every_epochs(task_idx)
-#   - min_lr_ratio → get_min_lr_ratio(task_idx)（仍低于 D4C_MIN_LR_RATIO 环境变量）
-#   - lr / coef / adv → get_task_config(task_idx) / format_step3_task_params_line()
+# 训练入口请使用 build_resolved_training_config（含 CLI）。下列 shell 辅助函数仅无 CLI 时读取 ENV/预设：
+#   - get_train_batch_size(task_idx) / get_epochs(task_idx)
 #
-# task_idx 来源：函数实参，或环境变量 D4C_PRESET_TASK_ID（shell 的 run_step3 每任务会设置）。
+# task_idx 来源：函数实参，或环境变量 D4C_PRESET_TASK_ID（shell 的 run_step3_optimized.sh 等每任务会设置）。
 # 总优先级：CLI > 对应环境变量 > 预设切片 > 代码默认（mode 相关项在各自 getter 内处理）。
 # ---------------------------------------------------------------------------
 
@@ -554,19 +547,202 @@ def _validate_training_presets(presets: Dict[str, Any], *, name: str = "TRAINING
             _check_row(blob, f"预设 {preset_name!r}（全局）")
 
 
-_GB1024_EP30_FE2_ROW: Dict[str, Any] = {
-    "train_batch_size": 1024,
-    "epochs": 30,
-    "full_eval_every_epochs": 2,
-    "min_lr_ratio": 0.1,
-    "adv": 0.005,
+# step3 / step5：1..8 每任务单独一份完整 dict（手写展开，无推导式），便于后续逐 task 微调。
+# 二者数值相同；step5 为各行独立副本，避免运行时误改一处影响另一预设。
+# train_batch_size/epochs/full_eval_every_epochs/min_lr_ratio/adv 各任务相同；lr/coef 与对应 task_configs 对齐。
+_TRAINING_PRESET_STEP3_TABLE: Dict[int, Any] = {
+    1: {
+        "train_batch_size": 1024,
+        "epochs": 30,
+        "full_eval_every_epochs": 2,
+        "min_lr_ratio": 0.1,
+        "adv": 0.005,
+        "lr": 5e-4,
+        "coef": 1,
+    },
+    2: {
+        "train_batch_size": 1024,
+        "epochs": 30,
+        "full_eval_every_epochs": 2,
+        "min_lr_ratio": 0.1,
+        "adv": 0.005,
+        "lr": 1e-3,
+        "coef": 0.1,
+    },
+    3: {
+        "train_batch_size": 1024,
+        "epochs": 30,
+        "full_eval_every_epochs": 2,
+        "min_lr_ratio": 0.1,
+        "adv": 0.005,
+        "lr": 5e-4,
+        "coef": 0.5,
+    },
+    4: {
+        "train_batch_size": 1024,
+        "epochs": 30,
+        "full_eval_every_epochs": 2,
+        "min_lr_ratio": 0.1,
+        "adv": 0.005,
+        "lr": 1e-3,
+        "coef": 0.5,
+    },
+    5: {
+        "train_batch_size": 1024,
+        "epochs": 30,
+        "full_eval_every_epochs": 2,
+        "min_lr_ratio": 0.1,
+        "adv": 0.005,
+        "lr": 1e-3,
+        "coef": 0.5,
+    },
+    6: {
+        "train_batch_size": 1024,
+        "epochs": 30,
+        "full_eval_every_epochs": 2,
+        "min_lr_ratio": 0.1,
+        "adv": 0.005,
+        "lr": 1e-3,
+        "coef": 0.5,
+    },
+    7: {
+        "train_batch_size": 1024,
+        "epochs": 30,
+        "full_eval_every_epochs": 2,
+        "min_lr_ratio": 0.1,
+        "adv": 0.005,
+        "lr": 1e-4,
+        "coef": 0.5,
+    },
+    8: {
+        "train_batch_size": 1024,
+        "epochs": 30,
+        "full_eval_every_epochs": 2,
+        "min_lr_ratio": 0.1,
+        "adv": 0.005,
+        "lr": 5e-4,
+        "coef": 1,
+    },
 }
 
-TRAINING_PRESETS: Dict[str, Any] = {
-    "gb1024_ep30_fe2": {i: dict(_GB1024_EP30_FE2_ROW) for i in range(1, 9)},
+_TRAINING_PRESETS_BUILTIN: Dict[str, Any] = {
+    "step3": _TRAINING_PRESET_STEP3_TABLE,
+    "step5": {tid: dict(row) for tid, row in _TRAINING_PRESET_STEP3_TABLE.items()},
 }
+
+TRAINING_PRESETS: Dict[str, Any] = _TRAINING_PRESETS_BUILTIN
+_LOADED_TRAINING_YAML = _try_load_training_presets_from_yaml()
+if _LOADED_TRAINING_YAML is not None:
+    TRAINING_PRESETS = _LOADED_TRAINING_YAML
 
 _validate_training_presets(TRAINING_PRESETS)
+
+# ---------------------------------------------------------------------------
+# 命名 runtime 预设（可选）
+#
+# 使用：export D4C_RUNTIME_PRESET=<键名>
+# 解析优先级（与训练预设平行）：runtime_base → runtime_preset → ENV → CLI（仅 build_resolved 中带 CLI）
+# 不设置 D4C_RUNTIME_PRESET 时行为与改造前一致（仍走 base + MAX_PARALLEL_CPU 等 ENV）。
+#
+# 线程类环境变量（OMP_NUM_THREADS / MKL_NUM_THREADS / TOKENIZERS_PARALLELISM）请在 shell 中设置；
+# 本模块不在 import 时覆盖它们。
+# ---------------------------------------------------------------------------
+
+_RUNTIME_PRESET_ALLOWED_KEYS: FrozenSet[str] = frozenset(
+    {
+        "max_parallel_cpu",
+        "num_proc",
+        "dataloader_num_workers_train",
+        "dataloader_num_workers_valid",
+        "dataloader_num_workers_test",
+        "dataloader_prefetch_factor_train",
+        "dataloader_prefetch_factor_valid",
+        "dataloader_prefetch_factor_test",
+        "dataloader_workers_train_per_rank_cap",
+    }
+)
+
+_RUNTIME_PRESET_INT_KEYS: FrozenSet[str] = _RUNTIME_PRESET_ALLOWED_KEYS
+
+
+def _validate_runtime_presets(presets: Dict[str, Any], *, name: str = "RUNTIME_PRESETS") -> None:
+    for preset_name, blob in presets.items():
+        if not isinstance(blob, dict):
+            raise TypeError(f'{name} 中预设 {preset_name!r} 应为 dict，当前为 {type(blob).__name__}')
+        unknown = set(blob.keys()) - _RUNTIME_PRESET_ALLOWED_KEYS
+        if unknown:
+            raise ValueError(
+                f"{name} 预设 {preset_name!r} 含有未知字段 {sorted(unknown)}；"
+                f"允许: {sorted(_RUNTIME_PRESET_ALLOWED_KEYS)}"
+            )
+        for k, v in blob.items():
+            if k in _RUNTIME_PRESET_INT_KEYS:
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise TypeError(f"{name} 预设 {preset_name!r} 字段 {k!r} 应为整数类型，当前为 {type(v).__name__}")
+                if isinstance(v, float) and not float(v).is_integer():
+                    raise ValueError(f"{name} 预设 {preset_name!r} 字段 {k!r} 应为整数值，当前为 {v!r}")
+                iv = int(v)
+                if iv < 0 and k != "num_proc":  # num_proc 必须 >=1，单独在值上约束
+                    raise ValueError(f"{name} 预设 {preset_name!r} 字段 {k!r} 不可为负，当前为 {iv}")
+                if k == "num_proc" and iv < 1:
+                    raise ValueError(f"{name} 预设 {preset_name!r} num_proc 须 >= 1，当前为 {iv}")
+
+
+_RUNTIME_PRESETS_BUILTIN: Dict[str, Dict[str, int]] = {
+    "gpu01_single_12c": {
+        "max_parallel_cpu": 10,
+        "num_proc": 6,
+        "dataloader_num_workers_train": 4,
+        "dataloader_num_workers_valid": 2,
+        "dataloader_num_workers_test": 2,
+        "dataloader_prefetch_factor_train": 2,
+        "dataloader_prefetch_factor_valid": 2,
+        "dataloader_prefetch_factor_test": 2,
+    },
+    "gpu01_ddp2_12c": {
+        "max_parallel_cpu": 10,
+        "num_proc": 4,
+        "dataloader_workers_train_per_rank_cap": 3,
+        "dataloader_num_workers_valid": 2,
+        "dataloader_num_workers_test": 2,
+        "dataloader_prefetch_factor_train": 2,
+        "dataloader_prefetch_factor_valid": 2,
+        "dataloader_prefetch_factor_test": 2,
+    },
+}
+
+RUNTIME_PRESETS: Dict[str, Dict[str, int]] = _RUNTIME_PRESETS_BUILTIN
+_LOADED_RUNTIME_YAML = _try_load_runtime_presets_from_yaml()
+if _LOADED_RUNTIME_YAML is not None:
+    RUNTIME_PRESETS = _LOADED_RUNTIME_YAML
+
+_validate_runtime_presets(RUNTIME_PRESETS)
+
+_unknown_runtime_preset_warned: Set[str] = set()
+
+
+def _named_runtime_preset_blob() -> Optional[Dict[str, Any]]:
+    name = (os.environ.get("D4C_RUNTIME_PRESET") or "").strip()
+    if not name:
+        return None
+    raw = RUNTIME_PRESETS.get(name)
+    if raw is None:
+        import warnings
+
+        if name not in _unknown_runtime_preset_warned:
+            _unknown_runtime_preset_warned.add(name)
+            warnings.warn(
+                f"未知 D4C_RUNTIME_PRESET={name!r}，忽略 runtime 预设（按未设置 preset 继续）。",
+                UserWarning,
+                stacklevel=2,
+            )
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _active_runtime_preset_slice() -> Optional[Dict[str, Any]]:
+    """当前激活的 runtime 预设 dict（全局单条）；无预设或未识别名字时为 None。"""
+    return _named_runtime_preset_blob()
 
 
 def _named_train_preset_blob() -> Optional[Dict[Any, Any]]:
@@ -618,63 +794,8 @@ def training_preset_is_per_task() -> bool:
 
 
 def get_task_config(task_idx: int) -> Optional[TaskConfig]:
-    base = task_configs.get(task_idx)
-    if base is None:
-        return None
-    p = _active_train_preset_slice(int(task_idx))
-    if not p:
-        return base
-    merged: TaskConfig = dict(base)
-    for k in ("lr", "coef", "adv"):
-        if k in p:
-            merged[k] = _coerce_task_param_numeric(p[k])  # type: ignore[assignment]
-    return merged
-
-
-def format_step3_task_params_line(task_idx: int) -> str:
-    """供 run_step3.sh / run_step5.sh 解析：auxiliary target lr coef adv（空格分隔）。"""
-    c = get_task_config(task_idx)
-    if not c:
-        return ""
-    return f"{c['auxiliary']} {c['target']} {c['lr']} {c['coef']} {c['adv']}"
-
-
-def get_train_batch_size(task_idx: Optional[int] = None) -> int:
-    """训练「全局有效 batch」G（每优化步跨所有 rank 的样本总数）；CLI 覆盖在脚本侧。"""
-    return _training_resolve_value(
-        cli=None,
-        env_names=(),
-        task_idx=task_idx,
-        preset_key="train_batch_size",
-        code_default=train_batch_size,
-        preset_reader=lambda raw: _preset_int_min(raw, 1),
-    )
-
-
-def get_gradient_accumulation_steps(task_idx: Optional[int] = None) -> int:
-    """梯度累积步数 A（每优化步内的微批次数）；D4C_GRADIENT_ACCUMULATION_STEPS 优先于命名预设与模块默认。"""
-    return _training_resolve_value(
-        cli=None,
-        env_names=("D4C_GRADIENT_ACCUMULATION_STEPS",),
-        env_reader=lambda s: _preset_int_min(s, 1),
-        task_idx=task_idx,
-        preset_key="gradient_accumulation_steps",
-        code_default=gradient_accumulation_steps,
-        preset_reader=lambda raw: _preset_int_min(raw, 1),
-    )
-
-
-def get_per_device_train_batch_size_optional(task_idx: Optional[int] = None) -> Optional[int]:
-    """
-    若设置，则与全局 batch G、world_size 一起推导出梯度累积步数 A。
-    优先级：D4C_PER_DEVICE_BATCH_SIZE > 命名预设 per_device_train_batch_size（无模块级默认，未设返回 None）。
-    """
-    if "D4C_PER_DEVICE_BATCH_SIZE" in os.environ:
-        return max(1, int(os.environ["D4C_PER_DEVICE_BATCH_SIZE"]))
-    row = _active_train_preset_slice(task_idx)
-    if row and "per_device_train_batch_size" in row:
-        return max(1, int(row["per_device_train_batch_size"]))
-    return None
+    """仅返回 TASK_DEFAULTS 表项（不含预设合并）；训练时以 build_resolved_training_config 为准。"""
+    return TASK_DEFAULTS.get(int(task_idx))
 
 
 def resolve_ddp_train_microbatch_layout(
@@ -683,18 +804,8 @@ def resolve_ddp_train_microbatch_layout(
     *,
     per_device_batch_size: Optional[int] = None,
     gradient_accumulation_steps: Optional[int] = None,
-    task_idx: Optional[int] = None,
 ) -> Tuple[int, int, int]:
-    """
-    由「全局有效 batch」G 解析 (G, P, A)，满足 G = P × world_size × A。
-
-    - P：每 rank、每 optimizer step 的 DataLoader 微批大小（per-rank micro-batch）。
-    - A：gradient_accumulation_steps。
-    - 若给定 per_device_batch_size（CLI 或 get_per_device_train_batch_size_optional），则 A = G / (P × world_size)，
-      且当同时显式指定 gradient_accumulation_steps（非 None 的实参）时必须与推导的 A 一致。
-    - 否则 A 来自 gradient_accumulation_steps 实参，若无实参则用 get_gradient_accumulation_steps(task_idx)，
-      再令 P = G / (world_size × A)。
-    """
+    """由全局 batch G 解析 (G, P, A)，满足 G = P × world_size × A；梯度累积须由 resolve 层显式传入。"""
     G = int(global_batch_size)
     W = int(world_size)
     if G < 1:
@@ -722,17 +833,14 @@ def resolve_ddp_train_microbatch_layout(
                 )
         return G, P, A
 
-    if explicit_accum_arg:
-        A = max(1, int(gradient_accumulation_steps))  # type: ignore[arg-type]
-    else:
-        A = get_gradient_accumulation_steps(task_idx)
-
+    if not explicit_accum_arg:
+        raise ValueError("未指定 per_device_batch_size 时必须提供 gradient_accumulation_steps")
+    A = max(1, int(gradient_accumulation_steps))
     denom = W * A
     if G % denom != 0:
         raise ValueError(
             f"全局 batch ({G}) 须能被 world_size×gradient_accumulation_steps ({denom}) 整除；"
-            f"当前 world_size={W}，accum={A}。可设置 D4C_PER_DEVICE_BATCH_SIZE / --per-device-batch-size "
-            f"以在保持全局 batch 不变的前提下换用更小的每卡微批。"
+            f"当前 world_size={W}，accum={A}。"
         )
     P = G // denom
     return G, P, A
@@ -743,31 +851,19 @@ def get_embed_batch_size():
     return embed_batch_size
 
 
-def get_eval_batch_size():
-    """返回 eval 推理阶段的「全局 batch」；DDP 下每 rank 批大小 = 该值 / world_size"""
-    return eval_batch_size
-
-
-def get_epochs(task_idx: Optional[int] = None) -> int:
-    """返回训练轮数，供 Step 3/5 使用。"""
-    return _training_resolve_value(
-        cli=None,
-        env_names=(),
-        task_idx=task_idx,
-        preset_key="epochs",
-        code_default=epochs,
-        preset_reader=lambda raw: _preset_int_min(raw, 1),
+def get_eval_batch_size(cli: Optional[int] = None) -> int:
+    """eval 全局 batch；优先级：cli > EVAL_BATCH_SIZE > BASE_TRAINING_DEFAULTS.eval_batch_size。"""
+    if cli is not None:
+        return max(1, int(cli))
+    return max(
+        1,
+        int(
+            os.environ.get(
+                "EVAL_BATCH_SIZE",
+                str(BASE_TRAINING_DEFAULTS.eval_batch_size),
+            )
+        ),
     )
-
-
-def get_train_min_epochs():
-    """至少训练轮数后再允许早停；未设置 TRAIN_MIN_EPOCHS 时依 D4C_TRAIN_MODE 取默认。"""
-    return _env_int_choice("TRAIN_MIN_EPOCHS", 30, 8)
-
-
-def get_train_early_stop_patience():
-    """valid 连续变差多少次触发早停；未设置 TRAIN_EARLY_STOP_PATIENCE 时依 mode 取默认。"""
-    return _env_int_choice("TRAIN_EARLY_STOP_PATIENCE", 15, 6)
 
 
 def _first_env_int_max1(names: Tuple[str, ...]) -> Optional[int]:
@@ -777,67 +873,112 @@ def _first_env_int_max1(names: Tuple[str, ...]) -> Optional[int]:
     return None
 
 
-def get_train_early_stop_patience_full() -> int:
-    """
-    optimized + full BLEU 周期评估时：连续多少次 **full eval** 未刷新 best 则早停（quick eval 不参与计数）。
-    未设置 TRAIN_EARLY_STOP_PATIENCE_FULL / D4C_EARLY_STOP_PATIENCE_FULL 时，与 TRAIN_EARLY_STOP_PATIENCE / get_train_early_stop_patience() 同义。
-    """
-    v = _first_env_int_max1(("TRAIN_EARLY_STOP_PATIENCE_FULL", "D4C_EARLY_STOP_PATIENCE_FULL"))
-    if v is not None:
-        return v
-    return get_train_early_stop_patience()
+def _fixed_dataloader_prefetch_factor(num_workers: int) -> Optional[int]:
+    if num_workers <= 0:
+        return None
+    return max(2, 4)
 
 
-def resolve_early_stop_patience_loss(
-    cli_patience_loss: Optional[int],
-    cli_patience: Optional[int],
-) -> int:
-    """
-    dual_bleu 下 valid_loss 连续变差早停耐心，与 full BLEU 的 patience_full 独立。
-    优先级：--early-stop-patience-loss > TRAIN_EARLY_STOP_PATIENCE_LOSS / D4C_EARLY_STOP_PATIENCE_LOSS
-    > --early-stop-patience > get_train_early_stop_patience()。
-    """
-    if cli_patience_loss is not None:
-        return max(1, int(cli_patience_loss))
-    v = _first_env_int_max1(("TRAIN_EARLY_STOP_PATIENCE_LOSS", "D4C_EARLY_STOP_PATIENCE_LOSS"))
-    if v is not None:
-        return v
-    if cli_patience is not None:
-        return max(1, int(cli_patience))
-    return get_train_early_stop_patience()
-
-
-def get_train_bleu4_max_samples():
-    """BLEU-4 quick 评估最大条数；未设置 TRAIN_BLEU4_MAX_SAMPLES 时依 mode 取默认。"""
-    if "TRAIN_BLEU4_MAX_SAMPLES" in os.environ:
-        return max(64, int(os.environ["TRAIN_BLEU4_MAX_SAMPLES"]))
-    return 512 if get_train_mode() == "optimized" else 2048
-
-
-def get_num_proc():
-    """返回 datasets.map（Tokenize）等使用的并行进程数；与 DataLoader 的 num_workers 无关，见 get_dataloader_num_workers()"""
-    return num_proc
-
-
-def get_max_parallel_cpu():
-    """与 MAX_PARALLEL_CPU 一致（默认 12）；DDP 每 rank 的 DataLoader worker 上限等可复用。"""
-    return _MAX_PARALLEL_CPU
-
-
-def get_dataloader_num_workers(split="train"):
-    """
-    PyTorch DataLoader 的 num_workers，与 datasets.map 的 num_proc 独立。
-    split: 'train' | 'valid' | 'test' — 训练/验证/推理测试可适当区分上限。
-    单路 worker 数不超过 _MAX_PARALLEL_CPU（默认 12），避免在 12 核节点上过度抢占。
-    """
-    n = _num_cpu or 8
-    cap_t = min(_MAX_PARALLEL_CPU, 16)  # 训练侧单 DataLoader 上限
-    cap_v = min(max(4, _MAX_PARALLEL_CPU // 2), 8)  # 验证/测试略保守
+def _auto_derive_dataloader_num_workers(split: str, cap_parallel: int) -> int:
+    """无 runtime preset / 无对应 ENV 时的 DataLoader workers 推导（与历史逻辑一致）。"""
+    _cap = int(cap_parallel)
+    n = _get_num_cpu()
+    cap_t = min(_cap, 16)
+    cap_v = min(max(4, _cap // 2), 8)
     if split == "train":
         return min(max(2, n // 2), cap_t)
     if split in ("valid", "test"):
         return min(max(1, n // 4), cap_v)
     return min(max(1, n // 4), cap_v)
+
+
+def _dataloader_workers_env_key(split: str) -> Optional[str]:
+    if split == "train":
+        return "D4C_DATALOADER_WORKERS_TRAIN"
+    if split == "valid":
+        return "D4C_DATALOADER_WORKERS_VALID"
+    if split == "test":
+        return "D4C_DATALOADER_WORKERS_TEST"
+    return None
+
+
+def _dataloader_prefetch_env_key(split: Optional[str]) -> Optional[str]:
+    if split == "train":
+        return "D4C_PREFETCH_TRAIN"
+    if split in ("valid", "eval"):
+        return "D4C_PREFETCH_VALID"
+    if split == "test":
+        return "D4C_PREFETCH_TEST"
+    return None
+
+
+def _resolve_dataloader_num_workers_for_split(split: str, cli: Optional[int]) -> int:
+    """runtime 自动推导 → runtime_preset → ENV → 可选 CLI。"""
+    mp = _resolve_max_parallel_cpu_cli(None)
+    nw = _auto_derive_dataloader_num_workers(split, mp)
+    rp = _active_runtime_preset_slice()
+    wkey = f"dataloader_num_workers_{split}" if split in ("train", "valid", "test") else None
+    if rp and wkey and wkey in rp:
+        nw = max(0, int(rp[wkey]))
+    ek = _dataloader_workers_env_key(split)
+    if ek and ek in os.environ:
+        nw = max(0, int(os.environ[ek]))
+    if cli is not None:
+        nw = max(0, int(cli))
+    return nw
+
+
+def _resolve_num_proc_cli(num_proc_cli: Optional[int]) -> int:
+    """derived(min(cpu,max_parallel)) → runtime_preset → D4C_NUM_PROC → CLI。"""
+    mp = _resolve_max_parallel_cpu_cli(None)
+    v = min(_get_num_cpu(), mp)
+    rp = _active_runtime_preset_slice()
+    if rp and "num_proc" in rp:
+        v = max(1, int(rp["num_proc"]))
+        v = min(v, _get_num_cpu())
+    if "D4C_NUM_PROC" in os.environ:
+        v = max(1, int(os.environ["D4C_NUM_PROC"]))
+        v = min(v, _get_num_cpu())
+    if num_proc_cli is not None:
+        v = max(1, int(num_proc_cli))
+        v = min(v, _get_num_cpu())
+    return v
+
+
+def _resolve_ddp_train_num_workers_per_rank_cli(world_size: int, cli_cap: Optional[int]) -> int:
+    ws = max(int(world_size), 1)
+    dl_train = _resolve_dataloader_num_workers_for_split("train", None)
+    share = max(1, _resolve_max_parallel_cpu_cli(None) // ws)
+    out = max(1, min(dl_train, share))
+    rp = _active_runtime_preset_slice()
+    if rp and "dataloader_workers_train_per_rank_cap" in rp:
+        cap = max(1, int(rp["dataloader_workers_train_per_rank_cap"]))
+        out = max(1, min(out, cap))
+    if "D4C_DATALOADER_TRAIN_PER_RANK_CAP" in os.environ:
+        cap = max(1, int(os.environ["D4C_DATALOADER_TRAIN_PER_RANK_CAP"]))
+        out = max(1, min(out, cap))
+    if cli_cap is not None:
+        cap = max(1, int(cli_cap))
+        out = max(1, min(out, cap))
+    return out
+
+
+def get_num_proc() -> int:
+    """datasets.map（Tokenize）并行进程数；与 DataLoader num_workers 独立。runtime_preset / D4C_NUM_PROC 可覆盖。"""
+    return _resolve_num_proc_cli(None)
+
+
+def get_max_parallel_cpu() -> int:
+    """并行 CPU 上限；runtime_preset → MAX_PARALLEL_CPU。"""
+    return _get_max_parallel_cpu()
+
+
+def get_dataloader_num_workers(split="train"):
+    """
+    PyTorch DataLoader 的 num_workers，与 datasets.map 的 num_proc 独立。
+    split: 'train' | 'valid' | 'test'。
+    """
+    return _resolve_dataloader_num_workers_for_split(str(split), None)
 
 
 @contextmanager
@@ -855,20 +996,663 @@ def hf_datasets_progress_bar(enabled: bool):
     yield
 
 
-def get_dataloader_prefetch_factor(num_workers: int):
-    """num_workers==0 时必须为 None。默认 4，可用环境变量 DATALOADER_PREFETCH_FACTOR 覆盖。"""
+def get_dataloader_prefetch_factor(num_workers: int, split: Optional[str] = None):
+    """
+    num_workers==0 时为 None。
+    若给定 split 且 runtime preset（或 D4C_PREFETCH_*）有值则用之；否则与历史一致为 prefetch=4。
+    """
     if num_workers <= 0:
         return None
-    return max(2, int(os.environ.get("DATALOADER_PREFETCH_FACTOR", "4")))
+    rp = _active_runtime_preset_slice()
+    if split == "train" and rp and "dataloader_prefetch_factor_train" in rp:
+        return max(2, int(rp["dataloader_prefetch_factor_train"]))
+    if split in ("valid", "eval") and rp and "dataloader_prefetch_factor_valid" in rp:
+        return max(2, int(rp["dataloader_prefetch_factor_valid"]))
+    if split == "test" and rp and "dataloader_prefetch_factor_test" in rp:
+        return max(2, int(rp["dataloader_prefetch_factor_test"]))
+    ek = _dataloader_prefetch_env_key(split)
+    if ek and ek in os.environ:
+        return max(2, int(os.environ[ek]))
+    return _fixed_dataloader_prefetch_factor(num_workers)
 
 
 def get_ddp_train_num_workers_per_rank(world_size: int) -> int:
     """
     DDP 下每个训练进程的 DataLoader worker 数。
-    在 world_size × workers 不超过 MAX_PARALLEL_CPU 均分份额的前提下，
-    尽量用满 get_dataloader_num_workers('train')，比「仅按 world_size 缩小」更易利用空闲 CPU。
+    world_size × workers 不超过 max_parallel_cpu 均分份额；可用 dataloader_workers_train_per_rank_cap 收紧。
     """
+    return _resolve_ddp_train_num_workers_per_rank_cli(world_size, None)
+
+
+def _runtime_cli_val(
+    runtime_overrides: Optional[Dict[str, Any]],
+    args: Any,
+    key: str,
+) -> Any:
+    """优先使用入口收集的 runtime_overrides（与 args 同源、非 None 字段），等价于显式 override dict。"""
+    if runtime_overrides is not None and key in runtime_overrides:
+        return runtime_overrides[key]
+    return getattr(args, key, None)
+
+
+@dataclass(frozen=True)
+class FinalTrainingConfig:
+    """入口 resolve 之后的冻结训练配置；训练循环只读此对象。"""
+
+    task_idx: int
+    auxiliary: str
+    target: str
+    preset_name: Optional[str]
+    world_size: int
+    sources: Tuple[Tuple[str, str], ...]
+
+    learning_rate: float
+    scheduler_initial_lr: float
+    initial_lr: float
+    epochs: int
+
+    train_batch_size: int
+    batch_size_global: int
+    batch_size: int
+    per_device_train_batch_size: int
+    gradient_accumulation_steps: int
+    effective_global_batch_size: int
+
+    num_proc: int
+    max_parallel_cpu: int
+    runtime_preset_name: Optional[str]
+    dataloader_num_workers_train: int
+    dataloader_num_workers_valid: int
+    dataloader_num_workers_test: int
+    dataloader_prefetch_factor_train: Optional[int]
+    dataloader_prefetch_factor_valid: Optional[int]
+    dataloader_prefetch_factor_test: Optional[int]
+
+    min_lr_ratio: float
+    lr_scheduler: str
+    scheduler_type: str
+    warmup_epochs: float
+    d4c_warmup_steps: Optional[int]
+    d4c_warmup_ratio: Optional[float]
+
+    eval_batch_size: int
+    min_epochs: int
+    train_min_epochs: int
+    early_stop_patience: int
+    early_stop_patience_full: int
+    early_stop_patience_loss: int
+
+    full_eval_every_epochs: int
+    full_bleu_eval_every_epochs: int
+    full_eval_phased: Optional[Tuple[int, int, int]]
+
+    checkpoint_metric: str
+    dual_bleu_eval: bool
+    bleu4_max_samples: int
+    quick_eval_max_samples: int
+
+    coef: float
+    eta: float
+    adversarial_coef: float
+    adversarial_alpha: float
+    adversarial_beta: float
+    adversarial_schedule_enabled: bool
+    adversarial_start_epoch: int
+    adversarial_warmup_epochs: int
+    adversarial_coef_target: float
+
+    emsize: int = 768
+    nlayers: int = 2
+    nhid: int = 2048
+    ntoken: int = 32128
+    dropout: float = 0.2
+    nhead: int = 2
+    nuser: int = 0
+    nitem: int = 0
+
+    device: int = 0
+    device_ids: Tuple[int, ...] = ()
+    save_file: str = ""
+    log_file: Optional[str] = None
+    ddp_world_size: int = 1
+    ddp_find_unused_parameters: bool = True
+    rank0_only_logging: bool = True
+    run_id: str = ""
+    ddp_fast_backends: bool = False
+
+    logger: Any = None
+    valid_dataset: Any = None
+
+    def to_log_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d.pop("logger", None)
+        d.pop("valid_dataset", None)
+        d["sources"] = dict(self.sources)
+        return d
+
+
+def build_resolved_training_config(
+    args: Any,
+    *,
+    task_idx: int,
+    world_size: int,
+    runtime_overrides: Optional[Dict[str, Any]] = None,
+) -> FinalTrainingConfig:
+    """
+    唯一训练配置解析入口：base → TASK_DEFAULTS → 命名预设 → ENV → CLI，一次性冻结为 FinalTrainingConfig。
+    """
+    ro = runtime_overrides if runtime_overrides is not None else collect_training_runtime_overrides_from_args(args)
+    src: Dict[str, str] = {}
+
+    def rv(key: str) -> Any:
+        return _runtime_cli_val(ro, args, key)
+
+    tid = int(task_idx)
+    tc = TASK_DEFAULTS.get(tid)
+    if tc is None:
+        raise ValueError(f"无效 task_idx={tid}，TASK_DEFAULTS 中无此任务")
+    auxiliary = str(tc["auxiliary"])
+    target = str(tc["target"])
+    row = _active_train_preset_slice(tid)
+    preset_nm = (os.environ.get("D4C_TRAIN_PRESET") or "").strip() or None
+
+    # ----- global train batch G -----
+    G = int(BASE_TRAINING_DEFAULTS.train_batch_size)
+    src["train_batch_size"] = "base"
+    if row and "train_batch_size" in row:
+        G = _preset_int_min(row["train_batch_size"], 1)
+        src["train_batch_size"] = "preset"
+    if "D4C_TRAIN_BATCH_SIZE" in os.environ:
+        G = _preset_int_min(os.environ["D4C_TRAIN_BATCH_SIZE"], 1)
+        src["train_batch_size"] = "env"
+    elif "D4C_OPT_BATCH_SIZE" in os.environ:
+        G = _preset_int_min(os.environ["D4C_OPT_BATCH_SIZE"], 1)
+        src["train_batch_size"] = "env"
+    if rv("batch_size") is not None:
+        G = int(rv("batch_size"))
+        src["train_batch_size"] = "cli"
+
+    # ----- per-device P -----
+    p_opt: Optional[int] = None
+    src["per_device_train_batch_size"] = "base"
+    if row and "per_device_train_batch_size" in row:
+        p_opt = max(1, int(row["per_device_train_batch_size"]))
+        src["per_device_train_batch_size"] = "preset"
+    if "D4C_PER_DEVICE_BATCH_SIZE" in os.environ:
+        p_opt = max(1, int(os.environ["D4C_PER_DEVICE_BATCH_SIZE"]))
+        src["per_device_train_batch_size"] = "env"
+    if rv("per_device_batch_size") is not None:
+        p_opt = max(1, int(rv("per_device_batch_size")))
+        src["per_device_train_batch_size"] = "cli"
+
+    # ----- gradient accumulation (merged before layout) -----
+    A0 = int(BASE_TRAINING_DEFAULTS.gradient_accumulation_steps)
+    src["gradient_accumulation_steps"] = "base"
+    if row and "gradient_accumulation_steps" in row:
+        A0 = _preset_int_min(row["gradient_accumulation_steps"], 1)
+        src["gradient_accumulation_steps"] = "preset"
+    if "D4C_GRADIENT_ACCUMULATION_STEPS" in os.environ:
+        A0 = _preset_int_min(os.environ["D4C_GRADIENT_ACCUMULATION_STEPS"], 1)
+        src["gradient_accumulation_steps"] = "env"
+    a_cli_raw = rv("gradient_accumulation_steps")
+    a_cli = int(a_cli_raw) if a_cli_raw is not None else None
+    if a_cli is not None:
+        A0 = max(1, int(a_cli))
+        src["gradient_accumulation_steps"] = "cli"
+
+    if p_opt is not None:
+        accum_for_layout: Optional[int] = a_cli
+    else:
+        accum_for_layout = A0
+    G, P, A = resolve_ddp_train_microbatch_layout(
+        G,
+        world_size,
+        per_device_batch_size=p_opt,
+        gradient_accumulation_steps=accum_for_layout,
+    )
+    eff = P * int(world_size) * A
+    if eff != G:
+        raise RuntimeError(f"内部错误: 期望 G={G} 与 P×W×A={eff} 一致")
+
+    # ----- epochs -----
+    ep = int(BASE_TRAINING_DEFAULTS.epochs)
+    src["epochs"] = "base"
+    if row and "epochs" in row:
+        ep = _preset_int_min(row["epochs"], 1)
+        src["epochs"] = "preset"
+    if "D4C_EPOCHS" in os.environ:
+        ep = _preset_int_min(os.environ["D4C_EPOCHS"], 1)
+        src["epochs"] = "env"
+    if rv("epochs") is not None:
+        ep = int(rv("epochs"))
+        src["epochs"] = "cli"
+
+    # ----- learning rate：BASE → task → preset → ENV → CLI（scheduler 覆盖 learning_rate）-----
+    initial_f = float(BASE_TRAINING_DEFAULTS.initial_learning_rate)
+    src["learning_rate"] = "base"
+    initial_f = float(tc["lr"])
+    src["learning_rate"] = "task"
+    if row and "lr" in row:
+        initial_f = float(_coerce_task_param_numeric(row["lr"]))
+        src["learning_rate"] = "preset"
+    if "D4C_INITIAL_LR" in os.environ:
+        initial_f = float(os.environ["D4C_INITIAL_LR"])
+        src["learning_rate"] = "env"
+    cli_lr = rv("learning_rate")
+    cli_sched = rv("scheduler_initial_lr")
+    if cli_lr is not None:
+        initial_f = float(cli_lr)
+        src["learning_rate"] = "cli"
+    if cli_sched is not None:
+        initial_f = float(cli_sched)
+        src["learning_rate"] = "cli"
+
+    # ----- min_lr_ratio -----
+    min_lr = float(BASE_TRAINING_DEFAULTS.min_lr_ratio)
+    src["min_lr_ratio"] = "base"
+    if row and "min_lr_ratio" in row:
+        min_lr = float(row["min_lr_ratio"])
+        src["min_lr_ratio"] = "preset"
+    if "D4C_MIN_LR_RATIO" in os.environ:
+        min_lr = float(os.environ["D4C_MIN_LR_RATIO"])
+        src["min_lr_ratio"] = "env"
+    if rv("min_lr_ratio") is not None:
+        min_lr = float(rv("min_lr_ratio"))
+        src["min_lr_ratio"] = "cli"
+
+    # ----- lr_scheduler -----
+    lr_sched = str(BASE_TRAINING_DEFAULTS.lr_scheduler)
+    src["lr_scheduler"] = "base"
+    if "D4C_LR_SCHEDULER" in os.environ:
+        v = os.environ["D4C_LR_SCHEDULER"].strip().lower()
+        if v in ("warmup_cosine", "warmup-cosine", "cosine"):
+            lr_sched = "warmup_cosine"
+        elif v in ("none", "off", "disabled"):
+            lr_sched = "none"
+        else:
+            lr_sched = "none"
+        src["lr_scheduler"] = "env"
+    cli_ls = rv("lr_scheduler")
+    if cli_ls is not None and str(cli_ls).strip():
+        v = str(cli_ls).strip().lower()
+        if v in ("none", "off", "disabled"):
+            lr_sched = "none"
+        elif v in ("warmup_cosine", "warmup-cosine", "cosine"):
+            lr_sched = "warmup_cosine"
+        else:
+            lr_sched = "none"
+        src["lr_scheduler"] = "cli"
+
+    # ----- warmup_epochs -----
+    wu_ep = float(BASE_TRAINING_DEFAULTS.warmup_epochs)
+    src["warmup_epochs"] = "base"
+    if "D4C_WARMUP_EPOCHS" in os.environ:
+        wu_ep = float(os.environ["D4C_WARMUP_EPOCHS"])
+        src["warmup_epochs"] = "env"
+    if rv("warmup_epochs") is not None:
+        wu_ep = float(rv("warmup_epochs"))
+        src["warmup_epochs"] = "cli"
+
+    # ----- warmup steps / ratio -----
+    wsteps: Optional[int] = None
+    src["d4c_warmup_steps"] = "base"
+    if "D4C_WARMUP_STEPS" in os.environ:
+        v = int(os.environ["D4C_WARMUP_STEPS"])
+        wsteps = v if v > 0 else None
+        src["d4c_warmup_steps"] = "env"
+    if rv("warmup_steps") is not None:
+        v = int(rv("warmup_steps"))
+        wsteps = v if v > 0 else None
+        src["d4c_warmup_steps"] = "cli"
+
+    wratio: Optional[float] = None
+    src["d4c_warmup_ratio"] = "base"
+    if "D4C_WARMUP_RATIO" in os.environ:
+        wratio = float(os.environ["D4C_WARMUP_RATIO"])
+        src["d4c_warmup_ratio"] = "env"
+    if rv("warmup_ratio") is not None:
+        wratio = float(rv("warmup_ratio"))
+        src["d4c_warmup_ratio"] = "cli"
+
+    # ----- eval batch -----
+    eval_bs = int(BASE_TRAINING_DEFAULTS.eval_batch_size)
+    src["eval_batch_size"] = "base"
+    if "EVAL_BATCH_SIZE" in os.environ:
+        eval_bs = max(1, int(os.environ["EVAL_BATCH_SIZE"]))
+        src["eval_batch_size"] = "env"
+    if rv("eval_batch_size") is not None:
+        eval_bs = max(1, int(rv("eval_batch_size")))
+        src["eval_batch_size"] = "cli"
+
+    # ----- early stop -----
+    min_ep = max(1, int(BASE_TRAINING_DEFAULTS.train_min_epochs))
+    src["min_epochs"] = "base"
+    if "TRAIN_MIN_EPOCHS" in os.environ:
+        min_ep = max(1, int(os.environ["TRAIN_MIN_EPOCHS"]))
+        src["min_epochs"] = "env"
+    if rv("min_epochs") is not None:
+        min_ep = max(1, int(rv("min_epochs")))
+        src["min_epochs"] = "cli"
+
+    esp = max(1, int(BASE_TRAINING_DEFAULTS.train_early_stop_patience))
+    src["early_stop_patience"] = "base"
+    if "TRAIN_EARLY_STOP_PATIENCE" in os.environ:
+        esp = max(1, int(os.environ["TRAIN_EARLY_STOP_PATIENCE"]))
+        src["early_stop_patience"] = "env"
+    _esp = rv("early_stop_patience")
+    if _esp is not None:
+        esp = max(1, int(_esp))
+        src["early_stop_patience"] = "cli"
+
+    esp_full_raw = rv("early_stop_patience_full")
+    if esp_full_raw is not None:
+        esp_full = max(1, int(esp_full_raw))
+        src["early_stop_patience_full"] = "cli"
+    elif _esp is not None:
+        esp_full = max(1, int(_esp))
+        src["early_stop_patience_full"] = "cli"
+    else:
+        v = _first_env_int_max1(("TRAIN_EARLY_STOP_PATIENCE_FULL", "D4C_EARLY_STOP_PATIENCE_FULL"))
+        if v is not None:
+            esp_full = v
+            src["early_stop_patience_full"] = "env"
+        else:
+            esp_full = esp
+            src["early_stop_patience_full"] = src["early_stop_patience"]
+
+    if rv("early_stop_patience_loss") is not None:
+        esp_loss = max(1, int(rv("early_stop_patience_loss")))
+        src["early_stop_patience_loss"] = "cli"
+    else:
+        v = _first_env_int_max1(("TRAIN_EARLY_STOP_PATIENCE_LOSS", "D4C_EARLY_STOP_PATIENCE_LOSS"))
+        if v is not None:
+            esp_loss = v
+            src["early_stop_patience_loss"] = "env"
+        elif _esp is not None:
+            esp_loss = max(1, int(_esp))
+            src["early_stop_patience_loss"] = "cli"
+        else:
+            esp_loss = esp
+            src["early_stop_patience_loss"] = src["early_stop_patience"]
+
+    # ----- BLEU samples -----
+    b4 = max(64, int(BASE_TRAINING_DEFAULTS.train_bleu4_max_samples))
+    src["bleu4_max_samples"] = "base"
+    if "TRAIN_BLEU4_MAX_SAMPLES" in os.environ:
+        b4 = max(64, int(os.environ["TRAIN_BLEU4_MAX_SAMPLES"]))
+        src["bleu4_max_samples"] = "env"
+    if rv("bleu4_max_samples") is not None:
+        b4 = max(64, int(rv("bleu4_max_samples")))
+        src["bleu4_max_samples"] = "cli"
+
+    qeval = b4
+    src["quick_eval_max_samples"] = "base"
+    if "D4C_QUICK_EVAL_MAX_SAMPLES" in os.environ:
+        qeval = max(64, int(os.environ["D4C_QUICK_EVAL_MAX_SAMPLES"]))
+        src["quick_eval_max_samples"] = "env"
+    if rv("quick_eval_max_samples") is not None:
+        qeval = max(64, int(rv("quick_eval_max_samples")))
+        src["quick_eval_max_samples"] = "cli"
+
+    # ----- full BLEU eval schedule -----
+    fe = 0
+    phased: Optional[Tuple[int, int, int]] = None
+    src["full_eval_schedule"] = "base"
+    cli_fe = rv("full_eval_every")
+    if cli_fe is not None:
+        fe = max(0, int(cli_fe))
+        phased = None
+        src["full_eval_schedule"] = "cli"
+    elif "D4C_FULL_EVAL_EVERY" in os.environ:
+        fe = max(0, int(os.environ["D4C_FULL_EVAL_EVERY"]))
+        phased = None
+        src["full_eval_schedule"] = "env"
+    elif "D4C_FULL_BLEU_EVAL_EVERY" in os.environ:
+        fe = max(0, int(os.environ["D4C_FULL_BLEU_EVAL_EVERY"]))
+        phased = None
+        src["full_eval_schedule"] = "env"
+    elif row and "full_eval_every_epochs" in row:
+        fe = max(0, int(row["full_eval_every_epochs"]))
+        phased = None
+        src["full_eval_schedule"] = "preset"
+    else:
+        early = max(1, int(os.environ.get("D4C_FULL_EVAL_EARLY_EVERY", "5")))
+        boundary = max(1, int(os.environ.get("D4C_FULL_EVAL_PHASE_END_EPOCH", "10")))
+        late = max(1, int(os.environ.get("D4C_FULL_EVAL_LATE_EVERY", "2")))
+        phased = (early, boundary, late)
+        src["full_eval_schedule"] = "env"
+
+    ckpt_metric = str(getattr(args, "checkpoint_metric", "bleu4"))
+    dual = ckpt_metric == "bleu4" and (fe > 0 or phased is not None)
+
+    # ----- coef / adversarial_coef -----
+    coef_f = float(_coerce_task_param_numeric(tc["coef"]))
+    src["coef"] = "task"
+    if row and "coef" in row:
+        coef_f = float(_coerce_task_param_numeric(row["coef"]))
+        src["coef"] = "preset"
+    if rv("coef") is not None:
+        coef_f = float(rv("coef"))
+        src["coef"] = "cli"
+
+    adv_f = float(_coerce_task_param_numeric(tc["adv"]))
+    src["adversarial_coef"] = "task"
+    if row and "adv" in row:
+        adv_f = float(_coerce_task_param_numeric(row["adv"]))
+        src["adversarial_coef"] = "preset"
+    if rv("adv") is not None:
+        adv_f = float(rv("adv"))
+        src["adversarial_coef"] = "cli"
+
+    # ----- eta (run-d4c) -----
+    eta_f = 1e-3
+    src["eta"] = "base"
+    eta_cli = getattr(args, "eta", None)
+    if eta_cli is not None:
+        eta_f = float(eta_cli)
+        src["eta"] = "cli"
+
+    # ----- adversarial schedule (仅 resolve 读 ENV，训练期不再读) -----
+    start = rv("adversarial_start_epoch")
+    src["adversarial_schedule"] = "base"
+    if start is None and "D4C_ADVERSARIAL_START_EPOCH" in os.environ:
+        start = int(os.environ["D4C_ADVERSARIAL_START_EPOCH"])
+        src["adversarial_schedule"] = "env"
+    if start is None:
+        adv_sched_on = False
+        adv_skip = 0
+        adv_warm = 0
+        adv_target = adv_f
+        src["adversarial_schedule_enabled"] = "base"
+    else:
+        adv_sched_on = True
+        adv_skip = max(0, int(start))
+        w = rv("adversarial_warmup_epochs")
+        if w is None and "D4C_ADVERSARIAL_WARMUP_EPOCHS" in os.environ:
+            w = int(os.environ["D4C_ADVERSARIAL_WARMUP_EPOCHS"])
+        if w is None:
+            adv_warm = 0
+        else:
+            adv_warm = max(0, int(w))
+        t = rv("adversarial_coef_target")
+        if t is None and "D4C_ADVERSARIAL_COEF_TARGET" in os.environ:
+            t = float(os.environ["D4C_ADVERSARIAL_COEF_TARGET"])
+        if t is None:
+            adv_target = adv_f
+        else:
+            adv_target = float(t)
+        src["adversarial_schedule_enabled"] = "cli" if rv("adversarial_start_epoch") is not None else "env"
+
+    # ----- runtime preset 元数据（D4C_RUNTIME_PRESET 原样记录；未知名时 blob 已为 None，行为等同未设 preset）-----
+    runtime_preset_nm = (os.environ.get("D4C_RUNTIME_PRESET") or "").strip() or None
+
+    # ----- max_parallel_cpu（runtime_base → runtime_preset → MAX_PARALLEL_CPU）-----
+    max_par_v = max(1, int(_RUNTIME_BASE_MAX_PARALLEL_CPU))
+    src["max_parallel_cpu"] = "base"
+    rp_rt = _active_runtime_preset_slice()
+    if rp_rt and "max_parallel_cpu" in rp_rt:
+        max_par_v = max(1, int(rp_rt["max_parallel_cpu"]))
+        src["max_parallel_cpu"] = "runtime_preset"
+    if "MAX_PARALLEL_CPU" in os.environ:
+        max_par_v = max(1, int(os.environ["MAX_PARALLEL_CPU"]))
+        src["max_parallel_cpu"] = "env"
+
+    # ----- num_proc（derived → runtime_preset → D4C_NUM_PROC → CLI）-----
+    num_proc_v = min(_get_num_cpu(), max_par_v)
+    src["num_proc"] = "derived"
+    if rp_rt and "num_proc" in rp_rt:
+        num_proc_v = max(1, int(rp_rt["num_proc"]))
+        num_proc_v = min(num_proc_v, _get_num_cpu())
+        src["num_proc"] = "runtime_preset"
+    if "D4C_NUM_PROC" in os.environ:
+        num_proc_v = max(1, int(os.environ["D4C_NUM_PROC"]))
+        num_proc_v = min(num_proc_v, _get_num_cpu())
+        src["num_proc"] = "env"
+    if rv("num_proc") is not None:
+        num_proc_v = max(1, int(rv("num_proc")))
+        num_proc_v = min(num_proc_v, _get_num_cpu())
+        src["num_proc"] = "cli"
+
     ws = max(int(world_size), 1)
-    dl_train = get_dataloader_num_workers("train")
-    share = max(1, get_max_parallel_cpu() // ws)
-    return max(1, min(dl_train, share))
+    nw_train = _resolve_ddp_train_num_workers_per_rank_cli(ws, None)
+    if rp_rt and (
+        "dataloader_num_workers_train" in rp_rt or "dataloader_workers_train_per_rank_cap" in rp_rt
+    ):
+        src["dataloader_num_workers_train"] = "runtime_preset"
+    elif "D4C_DATALOADER_WORKERS_TRAIN" in os.environ or "D4C_DATALOADER_TRAIN_PER_RANK_CAP" in os.environ:
+        src["dataloader_num_workers_train"] = "env"
+    else:
+        src["dataloader_num_workers_train"] = "derived"
+
+    dl_valid_base = _resolve_dataloader_num_workers_for_split("valid", None)
+    nw_valid = max(1, min(dl_valid_base, nw_train))
+    if rp_rt and "dataloader_num_workers_valid" in rp_rt:
+        src["dataloader_num_workers_valid"] = "runtime_preset"
+    elif "D4C_DATALOADER_WORKERS_VALID" in os.environ:
+        src["dataloader_num_workers_valid"] = "env"
+    else:
+        src["dataloader_num_workers_valid"] = "derived"
+
+    nw_test = _resolve_dataloader_num_workers_for_split("test", None)
+    if rp_rt and "dataloader_num_workers_test" in rp_rt:
+        src["dataloader_num_workers_test"] = "runtime_preset"
+    elif "D4C_DATALOADER_WORKERS_TEST" in os.environ:
+        src["dataloader_num_workers_test"] = "env"
+    else:
+        src["dataloader_num_workers_test"] = "derived"
+
+    pf_t = get_dataloader_prefetch_factor(nw_train, split="train")
+    pf_v = get_dataloader_prefetch_factor(nw_valid, split="valid")
+    pf_test = get_dataloader_prefetch_factor(nw_test, split="test")
+    src["dataloader_prefetch_factor_train"] = (
+        "runtime_preset"
+        if rp_rt and "dataloader_prefetch_factor_train" in rp_rt
+        else ("env" if "D4C_PREFETCH_TRAIN" in os.environ else "derived")
+    )
+    src["dataloader_prefetch_factor_valid"] = (
+        "runtime_preset"
+        if rp_rt and "dataloader_prefetch_factor_valid" in rp_rt
+        else ("env" if "D4C_PREFETCH_VALID" in os.environ else "derived")
+    )
+    src["dataloader_prefetch_factor_test"] = (
+        "runtime_preset"
+        if rp_rt and "dataloader_prefetch_factor_test" in rp_rt
+        else ("env" if "D4C_PREFETCH_TEST" in os.environ else "derived")
+    )
+
+    sources_tuple = tuple(sorted(src.items()))
+
+    return FinalTrainingConfig(
+        task_idx=tid,
+        auxiliary=auxiliary,
+        target=target,
+        preset_name=preset_nm,
+        world_size=int(world_size),
+        sources=sources_tuple,
+        learning_rate=initial_f,
+        scheduler_initial_lr=initial_f,
+        initial_lr=initial_f,
+        epochs=ep,
+        train_batch_size=G,
+        batch_size_global=G,
+        batch_size=P,
+        per_device_train_batch_size=P,
+        gradient_accumulation_steps=A,
+        effective_global_batch_size=eff,
+        num_proc=num_proc_v,
+        max_parallel_cpu=max_par_v,
+        runtime_preset_name=runtime_preset_nm,
+        dataloader_num_workers_train=nw_train,
+        dataloader_num_workers_valid=nw_valid,
+        dataloader_num_workers_test=nw_test,
+        dataloader_prefetch_factor_train=pf_t,
+        dataloader_prefetch_factor_valid=pf_v,
+        dataloader_prefetch_factor_test=pf_test,
+        min_lr_ratio=min_lr,
+        lr_scheduler=lr_sched,
+        scheduler_type=lr_sched,
+        warmup_epochs=wu_ep,
+        d4c_warmup_steps=wsteps,
+        d4c_warmup_ratio=wratio,
+        eval_batch_size=eval_bs,
+        min_epochs=min_ep,
+        train_min_epochs=min_ep,
+        early_stop_patience=esp,
+        early_stop_patience_full=esp_full,
+        early_stop_patience_loss=esp_loss,
+        full_eval_every_epochs=fe,
+        full_bleu_eval_every_epochs=fe,
+        full_eval_phased=phased,
+        checkpoint_metric=ckpt_metric,
+        dual_bleu_eval=dual,
+        bleu4_max_samples=b4,
+        quick_eval_max_samples=qeval,
+        coef=coef_f,
+        eta=eta_f,
+        adversarial_coef=adv_f,
+        adversarial_alpha=adv_f,
+        adversarial_beta=adv_f,
+        adversarial_schedule_enabled=adv_sched_on,
+        adversarial_start_epoch=adv_skip,
+        adversarial_warmup_epochs=adv_warm,
+        adversarial_coef_target=adv_target,
+    )
+
+
+def get_train_batch_size(task_idx: Optional[int] = None) -> int:
+    """
+    全局训练 batch G；供 shell 等**无 argparse**场景（无 CLI 层）。
+    顺序：BASE → TRAINING_PRESET 切片 → ``D4C_TRAIN_BATCH_SIZE`` / ``D4C_OPT_BATCH_SIZE``。
+    """
+    G = int(BASE_TRAINING_DEFAULTS.train_batch_size)
+    row = _active_train_preset_slice(task_idx)
+    if row and "train_batch_size" in row:
+        G = _preset_int_min(row["train_batch_size"], 1)
+    if "D4C_TRAIN_BATCH_SIZE" in os.environ:
+        G = _preset_int_min(os.environ["D4C_TRAIN_BATCH_SIZE"], 1)
+    elif "D4C_OPT_BATCH_SIZE" in os.environ:
+        G = _preset_int_min(os.environ["D4C_OPT_BATCH_SIZE"], 1)
+    return G
+
+
+def get_epochs(task_idx: Optional[int] = None) -> int:
+    """
+    训练轮数；供 shell 等**无 argparse**场景。
+    顺序：BASE → 预设 → ``D4C_EPOCHS``。
+    """
+    ep = int(BASE_TRAINING_DEFAULTS.epochs)
+    row = _active_train_preset_slice(task_idx)
+    if row and "epochs" in row:
+        ep = _preset_int_min(row["epochs"], 1)
+    if "D4C_EPOCHS" in os.environ:
+        ep = _preset_int_min(os.environ["D4C_EPOCHS"], 1)
+    return ep
+
+
+def __getattr__(name: str) -> Any:
+    """兼容旧代码 ``from config import num_proc`` / ``eval_batch_size``（改为运行时解析）。"""
+    if name == "num_proc":
+        return get_num_proc()
+    if name == "eval_batch_size":
+        return get_eval_batch_size()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

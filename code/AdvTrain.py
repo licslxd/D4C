@@ -3,20 +3,21 @@
 域对抗预训练：模型与数据管线、DDP 训练、评估 CLI 合一。
 - 库用法：from AdvTrain import *（与 generate_counterfactual 等兼容）
 - 训练：torchrun ... AdvTrain.py train --auxiliary A --target B ...
-- 评估：python AdvTrain.py eval ...（单进程；可选 --gpus 做 DataParallel）
-        或 torchrun ... AdvTrain.py eval ...（多进程 DDP，与训练同 DDP_NPROC）
+- 评估：仅 torchrun / python -m torch.distributed.run 下 DDP（含 nproc_per_node=1 单卡 smoke）
 """
 import os
 import sys
 import copy
 import time
+import hashlib
 import warnings
 import argparse
 import contextlib
 import logging
 import math
+from dataclasses import replace
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -66,38 +67,20 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from perf_monitor import PerfMonitor, gather_ddp_gpu_stats_for_epoch_log
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, load_from_disk
 from config import (
-    get_train_batch_size,
+    FinalTrainingConfig,
+    apply_ddp_fast_torch_backends,
+    build_resolved_training_config,
     get_eval_batch_size,
-    get_epochs,
-    resolve_task_idx_from_aux_target,
-    resolve_ddp_train_microbatch_layout,
-    get_per_device_train_batch_size_optional,
-    get_num_proc,
     get_dataloader_num_workers,
     get_dataloader_prefetch_factor,
-    get_ddp_train_num_workers_per_rank,
+    get_num_proc,
     hf_datasets_progress_bar,
-    get_train_min_epochs,
-    get_train_early_stop_patience,
-    get_train_early_stop_patience_full,
-    resolve_early_stop_patience_loss,
-    get_train_bleu4_max_samples,
-    get_train_mode,
-    get_exact_reproduction,
-    get_allow_large_batch,
-    get_lr_scheduler_type,
-    get_warmup_epochs,
-    resolve_full_bleu_eval_training,
+    resolve_task_idx_from_aux_target,
     should_run_full_bleu_eval_epoch,
-    get_quick_eval_max_samples,
-    apply_optimized_torch_backends,
-    get_min_lr_ratio,
-    get_scheduler_initial_lr,
-    get_d4c_warmup_steps_optional,
-    get_d4c_warmup_ratio_optional,
 )
+from training_runtime_inputs import collect_training_runtime_overrides_from_args
 from lr_schedule_utils import resolve_warmup_steps, warmup_cosine_multiplier_lambda
 from bleu_valid_ddp import bleu4_explanation_full_valid_ddp
 from train_logging import (
@@ -105,6 +88,7 @@ from train_logging import (
     setup_train_logging,
     log_run_header,
     log_config_snapshot,
+    flush_preset_load_events,
     format_epoch_training_block,
     log_epoch_training_block,
     broadcast_run_paths_ddp,
@@ -114,10 +98,42 @@ from train_logging import (
     append_eval_run_summaries,
     LOGGER_NAME,
     logger_has_file_handler,
+    log_route_extra,
+    ROUTE_DETAIL,
+    ROUTE_SUMMARY,
+)
+from train_diagnostics import (
+    check_finite_loss,
+    check_finite_tensor,
+    collect_distributed_env_for_meta,
+    d4c_log_grad_interval,
+    d4c_log_step_interval,
+    d4c_log_step_loss_parts,
+    d4c_save_checkpoint,
+    d4c_timing_phase,
+    ddp_heartbeat,
+    log_grad_monitor,
+    log_step_sample,
+    log_training_crash,
+    maybe_log_grad_norm_diff_ddp,
+    warn_empty_batch,
+)
+
+_EVAL_REQUIRES_TORCHRUN_MSG = (
+    "AdvTrain.py eval 仅支持 torchrun / python -m torch.distributed.run 下的 DDP 主路径"
+    "（含 --nproc_per_node=1 单卡 DDP smoke，仍须 torchrun 启动）。\n"
+    "请勿使用 `python AdvTrain.py eval` 直接启动。\n"
+    "示例（在 code/ 目录）：\n"
+    "  DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 AdvTrain.py eval "
+    "--auxiliary <AUX> --target <TGT> [--batch-size N] [--log_file PATH]\n"
+    "多卡请设置 CUDA_VISIBLE_DEVICES 并使 nproc_per_node 与可见 GPU 数一致。"
 )
 
 _t5_path = T5_SMALL_DIR if os.path.exists(T5_SMALL_DIR) else "t5-small"
 tokenizer = T5Tokenizer.from_pretrained(_t5_path, legacy=True)
+
+# HuggingFace tokenize 磁盘缓存：修改 Processor/tokenize 语义或需强制失效时与 run-d4c 同步递增
+D4C_TOKENIZE_CACHE_VERSION = "v2"
 
 tasks = [
     ("AM_Electronics", "AM_CDs"),
@@ -376,24 +392,25 @@ def validModel(model, valid_dataloader, device):
 
 def validModel_sum_batches(model, valid_dataloader, device):
     """
-    DDP 训练时用于验证聚合：
-    - 返回 (loss_sum, num_batches)，在外面用 all_reduce 聚合再除以总 batches。
-    - 与原 validModel 的“按 batch 求平均”保持一致，避免语义漂移。
+    DDP 训练时用于验证聚合（与 train loss、Step5 valid 一致：样本加权）：
+    - 返回 (loss_sum, n_samples)，其中 loss_sum = Σ (batch 标量 loss × batch 内样本数)。
+    - 外层对两维做 all_reduce(SUM) 后，current_valid_loss = 全局 loss_sum / 全局 n_samples。
     """
     _model = get_underlying_model(model)
     model.eval()
     with torch.no_grad():
         loss_sum = 0.0
-        n_batches = 0
+        n_samples = 0
         for batch in valid_dataloader:
             user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = _model.gather(batch, device)
+            bsz = int(user_idx.size(0))
             pred_rating, _, word_dist, _, _, = model(user_idx, item_idx, tgt_input, domain_idx)
             loss_r = _model.rating_loss_fn(pred_rating, rating)
             loss_e = _model.exp_loss_fn(word_dist.view(-1, 32128), tgt_output.reshape(-1))
             loss = loss_r + loss_e
-            loss_sum += loss.item()
-            n_batches += 1
-        return loss_sum, n_batches
+            loss_sum += loss.detach().double().item() * bsz
+            n_samples += bsz
+        return loss_sum, n_samples
 
 
 def _log_tokenize_done(
@@ -416,54 +433,194 @@ def _log_tokenize_done(
         logging.info(msg)
 
 
+def _dist_barrier_if_initialized() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _safe_file_mtime(path: str) -> str:
+    try:
+        if not os.path.isfile(path):
+            return "missing"
+        return str(int(os.path.getmtime(path)))
+    except OSError:
+        return "na"
+
+
+def _tokenizer_cache_identity(tok) -> str:
+    nop = getattr(tok, "name_or_path", None) or getattr(tok, "name", None)
+    if nop:
+        return str(nop)
+    return type(tok).__name__
+
+
+def _build_tokenize_cache_fingerprint(
+    *,
+    train_path: str,
+    valid_path: str,
+    tok,
+    max_length: int,
+    cache_version: str,
+) -> str:
+    """稳定、简洁的 cache key 段（含可读版本前缀 + 12 位 sha1 截断）。"""
+    parts = [
+        f"train={os.path.abspath(train_path)}",
+        f"train_mtime={_safe_file_mtime(train_path)}",
+        f"valid={os.path.abspath(valid_path)}",
+        f"valid_mtime={_safe_file_mtime(valid_path)}",
+        f"tok={_tokenizer_cache_identity(tok)}",
+        f"maxlen={int(max_length)}",
+        f"ver={cache_version}",
+    ]
+    raw = "|".join(parts)
+    h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{cache_version}_{h}"
+
+
+def _build_step3_cache_dir(
+    task_idx: int,
+    train_path: str,
+    valid_path: str,
+    processor,
+    tok,
+    cache_version: str = D4C_TOKENIZE_CACHE_VERSION,
+) -> Tuple[str, str]:
+    fp = _build_tokenize_cache_fingerprint(
+        train_path=train_path,
+        valid_path=valid_path,
+        tok=tok,
+        max_length=int(getattr(processor, "max_length", 25)),
+        cache_version=cache_version,
+    )
+    cache_dir = os.path.join(get_checkpoint_task_dir(task_idx), f"hf_cache_step3_{fp}")
+    return cache_dir, fp
+
+
+def _build_eval_tokenize_cache_fingerprint(
+    *,
+    eval_data_path: str,
+    tok,
+    max_length: int,
+    cache_version: str,
+) -> str:
+    """
+    Step3 eval 子命令专用 tokenize 缓存 key（与 train 的 train+valid 缓存独立）。
+    字段需覆盖：eval 数据路径、mtime、tokenizer、max_length、版本、mode=eval。
+    """
+    parts = [
+        "mode=eval",
+        f"data={os.path.abspath(eval_data_path)}",
+        f"data_mtime={_safe_file_mtime(eval_data_path)}",
+        f"tok={_tokenizer_cache_identity(tok)}",
+        f"maxlen={int(max_length)}",
+        f"ver={cache_version}",
+    ]
+    raw = "|".join(parts)
+    h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{cache_version}_{h}"
+
+
+def _build_step3_eval_cache_dir(
+    task_idx: int,
+    eval_data_path: str,
+    processor,
+    tok,
+    cache_version: str = D4C_TOKENIZE_CACHE_VERSION,
+) -> Tuple[str, str]:
+    fp = _build_eval_tokenize_cache_fingerprint(
+        eval_data_path=eval_data_path,
+        tok=tok,
+        max_length=int(getattr(processor, "max_length", 25)),
+        cache_version=cache_version,
+    )
+    cache_dir = os.path.join(get_checkpoint_task_dir(task_idx), f"hf_cache_step3_eval_{fp}")
+    return cache_dir, fp
+
+
+def _hf_dataset_cache_ready(cache_dir: str) -> bool:
+    return os.path.isdir(cache_dir) and os.path.isfile(os.path.join(cache_dir, "dataset_dict.json"))
+
+
+def _log_tokenize_cache_line(msg: str, log_file: Optional[str]) -> None:
+    lg = logging.getLogger(LOGGER_NAME)
+    if not logger_has_file_handler(lg):
+        print(msg, flush=True)
+    if lg.handlers:
+        lg.info(msg)
+    else:
+        logging.info(msg)
+
+
+def _map_tokenize_train_valid_to_hf_cache(
+    *,
+    datasets: DatasetDict,
+    processor,
+    nproc: int,
+    cache_dir: str,
+    cache_fingerprint: str,
+    rank: int,
+    show_datasets_progress: bool,
+    log_tokenize: bool,
+    phase: str,
+    log_file: Optional[str],
+) -> DatasetDict:
+    """
+    rank0 负责 map + save_to_disk；barrier 后所有 rank load_from_disk。
+    cache 已存在时各 rank 直接 load（跳过 map）。
+    """
+    if _hf_dataset_cache_ready(cache_dir):
+        t_hit0 = time.perf_counter()
+        encoded_data = load_from_disk(cache_dir)
+        elapsed_hit = time.perf_counter() - t_hit0
+        if rank == 0 and log_tokenize:
+            msg = (
+                f"[Tokenize] {phase} cache hit | fingerprint={cache_fingerprint} | cache_dir={cache_dir} | "
+                f"load_wall_time={elapsed_hit:.2f}s"
+            )
+            _log_tokenize_cache_line(msg, log_file)
+        return encoded_data
+
+    if rank == 0:
+        t0 = time.perf_counter()
+        with hf_datasets_progress_bar(show_datasets_progress):
+            encoded_data = datasets.map(lambda sample: processor(sample), num_proc=nproc, desc="Tokenize")
+        encoded_data.save_to_disk(cache_dir)
+        elapsed = time.perf_counter() - t0
+        if log_tokenize:
+            _log_tokenize_done(phase, nproc, elapsed, log_file)
+            msg = (
+                f"[Tokenize] {phase} cache miss | fingerprint={cache_fingerprint} | cache_dir={cache_dir} | "
+                f"build_wall_time={elapsed:.2f}s"
+            )
+            _log_tokenize_cache_line(msg, log_file)
+
+    _dist_barrier_if_initialized()
+    encoded_data = load_from_disk(cache_dir)
+    return encoded_data
+
+
 def _load_advtrain_artefacts(
     args,
     device: int,
-    batch_size: int,
+    resolved: FinalTrainingConfig,
     *,
+    rank: int = 0,
     log_tokenize: bool = True,
     show_datasets_progress: bool = True,
 ):
-    task_idx = None
-    for idx, (aux, tgt) in enumerate(tasks):
-        if aux == args.auxiliary and tgt == args.target:
-            task_idx = idx + 1
-            break
-    if task_idx is None:
-        raise ValueError("未知的 auxiliary/target 组合")
-
+    task_idx = int(resolved.task_idx)
     path = os.path.join(MERGED_DATA_DIR, str(task_idx))
-    train_df = pd.read_csv(os.path.join(path, "aug_train.csv"))
-    nuser = train_df["user_idx"].max() + 1
-    nitem = train_df["item_idx"].max() + 1
+    train_path = os.path.join(path, "aug_train.csv")
+    valid_path = os.path.join(path, "aug_valid.csv")
+    train_df = pd.read_csv(train_path)
+    nuser = int(train_df["user_idx"].max()) + 1
+    nitem = int(train_df["item_idx"].max()) + 1
 
     os.makedirs(get_checkpoint_task_dir(task_idx), exist_ok=True)
-    epochs = args.epochs if args.epochs is not None else get_epochs(task_idx)
-    nproc = args.num_proc if args.num_proc is not None else get_num_proc()
+    nproc = int(resolved.num_proc)
+    save_file = args.save_file or os.path.join(get_checkpoint_task_dir(task_idx), "model.pth")
 
-    config = {
-        "task_idx": task_idx,
-        "device": device,
-        "device_ids": None,
-        "log_file": args.log_file,
-        "save_file": args.save_file or os.path.join(get_checkpoint_task_dir(task_idx), "model.pth"),
-        "learning_rate": args.learning_rate,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "num_proc": nproc,
-        "emsize": 768,
-        "nlayers": args.nlayers,
-        "nhid": 2048,
-        "ntoken": 32128,
-        "dropout": 0.2,
-        "nuser": nuser,
-        "nitem": nitem,
-        "coef": args.coef,
-        "adversarial_coef": args.adv,
-        "nhead": 2,
-    }
-
-    valid_df = pd.read_csv(os.path.join(path, "aug_valid.csv"))
+    valid_df = pd.read_csv(valid_path)
     train_df["item"] = train_df["item"].astype(str)
     valid_df["item"] = valid_df["item"].astype(str)
     datasets = DatasetDict({
@@ -471,15 +628,32 @@ def _load_advtrain_artefacts(
         "valid": Dataset.from_pandas(valid_df),
     })
     processor = Processor(args.auxiliary, args.target)
-    t0 = time.perf_counter()
-    with hf_datasets_progress_bar(show_datasets_progress):
-        encoded_data = datasets.map(lambda sample: processor(sample), num_proc=nproc, desc="Tokenize")
-    if log_tokenize:
-        _log_tokenize_done(
-            "train+valid",
-            nproc,
-            time.perf_counter() - t0,
+    cache_dir, cache_fp = _build_step3_cache_dir(
+        task_idx, train_path, valid_path, processor, tokenizer,
+    )
+    if rank == 0 and log_tokenize:
+        _log_tokenize_cache_line(
+            f"[Tokenize] step3 cache key | fingerprint={cache_fp} | cache_dir={cache_dir}",
             getattr(args, "log_file", None),
+        )
+    _tok_lg = logging.getLogger(LOGGER_NAME)
+    with d4c_timing_phase(
+        _tok_lg,
+        "tokenize_pipeline_step3_train_valid",
+        route=ROUTE_SUMMARY,
+        rank=rank,
+    ):
+        encoded_data = _map_tokenize_train_valid_to_hf_cache(
+            datasets=datasets,
+            processor=processor,
+            nproc=nproc,
+            cache_dir=cache_dir,
+            cache_fingerprint=cache_fp,
+            rank=rank,
+            show_datasets_progress=show_datasets_progress,
+            log_tokenize=log_tokenize,
+            phase="train+valid",
+            log_file=getattr(args, "log_file", None),
         )
     encoded_data.set_format("torch")
     train_dataset = TensorDataset(
@@ -523,52 +697,45 @@ def _load_advtrain_artefacts(
     item_profiles = torch.cat([titem_profiles, sitem_profiles], dim=0)
 
     model = Model(
-        config.get("nuser"), config.get("nitem"), config.get("ntoken"),
-        config.get("emsize"), config.get("nhead"), config.get("nhid"),
-        config.get("nlayers"), config.get("dropout"),
-        user_profiles, item_profiles, domain_profiles,
+        nuser,
+        nitem,
+        resolved.ntoken,
+        resolved.emsize,
+        resolved.nhead,
+        resolved.nhid,
+        args.nlayers,
+        resolved.dropout,
+        user_profiles,
+        item_profiles,
+        domain_profiles,
     ).to(device)
-    discriminator = Discriminator(config.get("emsize")).to(device)
-    return config, train_dataset, valid_dataset, model, discriminator
+    discriminator = Discriminator(resolved.emsize).to(device)
+    return train_dataset, valid_dataset, model, discriminator, nuser, nitem, save_file
 
 
-def build_config_and_data_ddp(args, rank: int, world_size: int, local_rank: int):
+def build_config_and_data_ddp(args, rank: int, world_size: int, local_rank: int) -> tuple:
     _tid = resolve_task_idx_from_aux_target(args.auxiliary, args.target)
     if _tid is None:
         raise ValueError("未知的 auxiliary/target 组合")
-    G_raw = args.batch_size if args.batch_size is not None else get_train_batch_size(_tid)
-    if getattr(args, "per_device_batch_size", None) is not None:
-        p_res = int(args.per_device_batch_size)
-    else:
-        p_res = get_per_device_train_batch_size_optional(_tid)
-    a_cli = getattr(args, "gradient_accumulation_steps", None)
-
-    G, P, A = resolve_ddp_train_microbatch_layout(
-        int(G_raw),
-        world_size,
-        per_device_batch_size=p_res,
-        gradient_accumulation_steps=a_cli,
+    _ro = collect_training_runtime_overrides_from_args(args)
+    resolved = build_resolved_training_config(
+        args,
         task_idx=_tid,
+        world_size=world_size,
+        runtime_overrides=_ro,
     )
-    eff_global = P * world_size * A
-    if eff_global != G:
-        raise RuntimeError(f"内部错误: 期望 G={G} 与 P×W×A={eff_global} 一致")
+    G = int(resolved.train_batch_size)
+    P = int(resolved.per_device_train_batch_size)
+    A = int(resolved.gradient_accumulation_steps)
 
-    config, train_dataset, valid_dataset, model, discriminator = _load_advtrain_artefacts(
+    train_dataset, valid_dataset, model, discriminator, nuser, nitem, save_file = _load_advtrain_artefacts(
         args,
         local_rank,
-        P,
+        resolved,
+        rank=rank,
         log_tokenize=(rank == 0),
         show_datasets_progress=(rank == 0),
     )
-    config["batch_size_global"] = G
-    config["effective_global_batch_size"] = eff_global
-    config["per_device_batch_size"] = P
-    config["gradient_accumulation_steps"] = A
-    config["ddp_world_size"] = world_size
-    config["batch_size"] = P
-    config["device"] = local_rank
-    config["device_ids"] = list(range(world_size))
 
     train_drop_last = A > 1
     sampler = DistributedSampler(
@@ -578,22 +745,18 @@ def build_config_and_data_ddp(args, rank: int, world_size: int, local_rank: int)
         shuffle=True,
         drop_last=train_drop_last,
     )
-    # DataLoader 并行加载：与 datasets.map 的 num_proc 独立，见 get_ddp_train_num_workers_per_rank
-    num_workers = get_ddp_train_num_workers_per_rank(world_size)
-    dl_valid_cfg = get_dataloader_num_workers("valid")
-    valid_num_workers = max(1, min(dl_valid_cfg, num_workers))
     pin_memory = torch.cuda.is_available()
-    _pf_train = get_dataloader_prefetch_factor(num_workers)
-    _pf_valid = get_dataloader_prefetch_factor(valid_num_workers)
+    nw_train = int(resolved.dataloader_num_workers_train)
+    nw_valid = int(resolved.dataloader_num_workers_valid)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=P,
         sampler=sampler,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=nw_train,
         pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=_pf_train,
+        persistent_workers=nw_train > 0,
+        prefetch_factor=resolved.dataloader_prefetch_factor_train,
         drop_last=train_drop_last,
     )
     n_train_micro = len(train_dataloader)
@@ -602,9 +765,7 @@ def build_config_and_data_ddp(args, rank: int, world_size: int, local_rank: int)
             f"train DataLoader 每 epoch 批次数为 {n_train_micro}，无法被 gradient_accumulation_steps={A} 整除。"
             f"请调整全局 batch、--per-device-batch-size、world_size 或数据划分；或令 accum=1。"
         )
-    # valid：不按梯度累积拆微批，每 rank 仍用「全局 batch / world_size」以维持与旧版一致的 valid 吞吐语义
     valid_per_rank = max(1, G // world_size)
-    # valid 也分片到所有 rank，避免 rank0 单点跑 valid 导致其它 rank 在 broadcast/all_reduce 上卡死。
     valid_sampler = DistributedSampler(
         valid_dataset,
         num_replicas=world_size,
@@ -617,13 +778,12 @@ def build_config_and_data_ddp(args, rank: int, world_size: int, local_rank: int)
         batch_size=valid_per_rank,
         sampler=valid_sampler,
         shuffle=False,
-        num_workers=valid_num_workers,
+        num_workers=nw_valid,
         pin_memory=pin_memory,
-        persistent_workers=valid_num_workers > 0,
-        prefetch_factor=_pf_valid,
+        persistent_workers=nw_valid > 0,
+        prefetch_factor=resolved.dataloader_prefetch_factor_valid,
     )
 
-    # True：对抗/多分支 forward 下常有子图未参与某步 loss；False 会触发 DDP reduction 报错（见 PyTorch 文档）
     _ddp_find_unused = bool(getattr(args, "ddp_find_unused_parameters", True))
     model = nn.parallel.DistributedDataParallel(
         model,
@@ -637,54 +797,21 @@ def build_config_and_data_ddp(args, rank: int, world_size: int, local_rank: int)
         output_device=local_rank,
         find_unused_parameters=_ddp_find_unused,
     )
-    config["ddp_find_unused_parameters"] = _ddp_find_unused
-    config["rank0_only_logging"] = True
-    config["dataloader_num_workers"] = {"train": int(num_workers), "valid": int(valid_num_workers)}
-    config["min_epochs"] = (
-        args.min_epochs if getattr(args, "min_epochs", None) is not None else get_train_min_epochs()
+    final_cfg = replace(
+        resolved,
+        nuser=nuser,
+        nitem=nitem,
+        save_file=save_file,
+        device=local_rank,
+        device_ids=tuple(range(world_size)),
+        ddp_world_size=world_size,
+        nlayers=args.nlayers,
+        valid_dataset=valid_dataset,
+        ddp_find_unused_parameters=_ddp_find_unused,
+        rank0_only_logging=True,
     )
-    config["early_stop_patience"] = (
-        args.early_stop_patience
-        if getattr(args, "early_stop_patience", None) is not None
-        else get_train_early_stop_patience()
-    )
-    if getattr(args, "early_stop_patience_full", None) is not None:
-        config["early_stop_patience_full"] = max(1, int(args.early_stop_patience_full))
-    elif getattr(args, "early_stop_patience", None) is not None:
-        config["early_stop_patience_full"] = max(1, int(args.early_stop_patience))
-    else:
-        config["early_stop_patience_full"] = get_train_early_stop_patience_full()
-    config["early_stop_patience_loss"] = resolve_early_stop_patience_loss(
-        getattr(args, "early_stop_patience_loss", None),
-        getattr(args, "early_stop_patience", None),
-    )
-    config["checkpoint_metric"] = getattr(args, "checkpoint_metric", "bleu4")
-    config["bleu4_max_samples"] = (
-        args.bleu4_max_samples
-        if getattr(args, "bleu4_max_samples", None) is not None
-        else get_train_bleu4_max_samples()
-    )
-    config["quick_eval_max_samples"] = (
-        args.quick_eval_max_samples
-        if getattr(args, "quick_eval_max_samples", None) is not None
-        else get_quick_eval_max_samples(int(config["bleu4_max_samples"]))
-    )
-    _fe, _phased = resolve_full_bleu_eval_training(
-        getattr(args, "full_eval_every", None),
-        task_idx=_tid,
-    )
-    config["full_eval_every_epochs"] = _fe
-    config["full_bleu_eval_every_epochs"] = _fe
-    config["full_eval_phased"] = _phased
-    config["dual_bleu_eval_optimized"] = (
-        get_train_mode() == "optimized"
-        and config["checkpoint_metric"] == "bleu4"
-        and (_fe > 0 or _phased is not None)
-    )
-    config["valid_dataset"] = valid_dataset
-    _apply_adversarial_schedule_to_config(args, config)
 
-    return config, train_dataloader, valid_dataloader, model, discriminator, sampler
+    return final_cfg, train_dataloader, valid_dataloader, model, discriminator, sampler
 
 
 @contextlib.contextmanager
@@ -697,7 +824,15 @@ def _ddp_no_sync_both(model, discriminator, world_size: int, sync_gradients: boo
             yield
 
 
-def _valid_bleu4_quick(model, valid_dataset, device, max_samples: int) -> float:
+def _valid_bleu4_quick(
+    model,
+    valid_dataset,
+    device,
+    max_samples: int,
+    *,
+    dataloader_num_workers: int,
+    dataloader_prefetch_factor: Optional[int],
+) -> float:
     """在验证集前 max_samples 条上算 BLEU-4（与 evaluate_text 词级 BLEU 一致），仅 rank0 调用。"""
     _m = get_underlying_model(model)
     n = min(len(valid_dataset), max_samples)
@@ -705,8 +840,8 @@ def _valid_bleu4_quick(model, valid_dataset, device, max_samples: int) -> float:
         return 0.0
     subset = Subset(valid_dataset, list(range(n)))
     bs = min(32, n)
-    _vn = min(2, get_dataloader_num_workers("valid"))
-    _pf = get_dataloader_prefetch_factor(_vn)
+    _vn = max(0, int(dataloader_num_workers))
+    _pf = dataloader_prefetch_factor if _vn > 0 else None
     dl = DataLoader(
         subset,
         batch_size=bs,
@@ -749,63 +884,33 @@ def _effective_adversarial_coef_epoch(
     return float(target) * min(1.0, t / float(warmup_epochs))
 
 
-def _apply_adversarial_schedule_to_config(args, config: dict) -> None:
-    """写入 adversarial_schedule_enabled / start_epoch / warmup_epochs / coef_target；未配置时与旧版一致。"""
-    legacy = float(config["adversarial_coef"])
-    start = getattr(args, "adversarial_start_epoch", None)
-    if start is None and "D4C_ADVERSARIAL_START_EPOCH" in os.environ:
-        start = int(os.environ["D4C_ADVERSARIAL_START_EPOCH"])
-    if start is None:
-        config["adversarial_schedule_enabled"] = False
-        config["adversarial_start_epoch"] = 0
-        config["adversarial_warmup_epochs"] = 0
-        config["adversarial_coef_target"] = legacy
-        return
-    w = getattr(args, "adversarial_warmup_epochs", None)
-    if w is None:
-        if "D4C_ADVERSARIAL_WARMUP_EPOCHS" in os.environ:
-            w = int(os.environ["D4C_ADVERSARIAL_WARMUP_EPOCHS"])
-        else:
-            w = 0
-    t = getattr(args, "adversarial_coef_target", None)
-    if t is None:
-        if "D4C_ADVERSARIAL_COEF_TARGET" in os.environ:
-            t = float(os.environ["D4C_ADVERSARIAL_COEF_TARGET"])
-        else:
-            t = legacy
-    config["adversarial_schedule_enabled"] = True
-    # adversarial_start_epoch = N：前 N 个 epoch（1..N）不启用对抗，自第 N+1 个 epoch 起 warmup
-    config["adversarial_start_epoch"] = max(0, int(start))
-    config["adversarial_warmup_epochs"] = max(0, int(w))
-    config["adversarial_coef_target"] = float(t)
-
-
 def trainModel_ddp(
     model,
     discriminator,
     train_dataloader,
     valid_dataloader,
     sampler,
-    config,
+    final_cfg: FinalTrainingConfig,
     rank,
     world_size,
     max_steps=None,
+    save_final_checkpoint: bool = False,
 ):
-    epochs = config["epochs"]
-    G = int(config.get("batch_size_global", config.get("batch_size", 0)))
-    P = int(config.get("per_device_batch_size", config.get("batch_size", 0)))
-    A = max(1, int(config.get("gradient_accumulation_steps", 1)))
-    eff = int(config.get("effective_global_batch_size", P * world_size * A))
-    initial_lr = float(config.get("scheduler_initial_lr", config["learning_rate"]))
+    epochs = final_cfg.epochs
+    G = int(final_cfg.train_batch_size)
+    P = int(final_cfg.per_device_train_batch_size)
+    A = max(1, int(final_cfg.gradient_accumulation_steps))
+    eff = int(final_cfg.effective_global_batch_size)
+    initial_lr = float(final_cfg.scheduler_initial_lr)
     learning_rate = initial_lr
-    coef = config["coef"]
-    adversarial_coef_legacy = float(config["adversarial_coef"])
-    adv_schedule_on = bool(config.get("adversarial_schedule_enabled", False))
-    adv_skip_epochs = int(config.get("adversarial_start_epoch", 0))
-    adv_warmup_epochs = int(config.get("adversarial_warmup_epochs", 0))
-    adv_coef_target = float(config.get("adversarial_coef_target", adversarial_coef_legacy))
+    coef = float(final_cfg.coef)
+    adversarial_coef_legacy = float(final_cfg.adversarial_coef)
+    adv_schedule_on = bool(final_cfg.adversarial_schedule_enabled)
+    adv_skip_epochs = int(final_cfg.adversarial_start_epoch)
+    adv_warmup_epochs = int(final_cfg.adversarial_warmup_epochs)
+    adv_coef_target = float(final_cfg.adversarial_coef_target)
     _model = get_underlying_model(model)
-    device = config["device"]
+    device = final_cfg.device
     n_micro = len(train_dataloader)
     n_steps = max(1, n_micro // A)
     train_info = (
@@ -813,37 +918,23 @@ def trainModel_ddp(
         f"per_device_batch_size={P} gradient_accumulation_steps={A} world_size={world_size} "
         f"micro_batches_per_epoch={n_micro} optimizer_steps_per_epoch={n_steps} epochs={epochs}"
     )
-    _lg = config.get("logger")
-    min_epochs = int(config.get("min_epochs", get_train_min_epochs()))
-    early_stop_patience = int(config.get("early_stop_patience", get_train_early_stop_patience()))
-    early_stop_patience_full = int(
-        config.get("early_stop_patience_full", get_train_early_stop_patience_full())
-    )
-    early_stop_patience_loss = int(
-        config.get(
-            "early_stop_patience_loss",
-            resolve_early_stop_patience_loss(None, None),
-        )
-    )
-    checkpoint_metric = config.get("checkpoint_metric", "bleu4")
-    bleu4_max_samples = int(config.get("bleu4_max_samples", get_train_bleu4_max_samples()))
-    quick_eval_max_samples = int(
-        config.get("quick_eval_max_samples", get_quick_eval_max_samples(bleu4_max_samples))
-    )
-    valid_dataset_for_bleu = config.get("valid_dataset")
-    lr_scheduler_type = config.get("lr_scheduler", get_lr_scheduler_type())
-    warmup_epochs = float(config.get("warmup_epochs", get_warmup_epochs()))
-    full_eval_every = int(
-        config.get("full_eval_every_epochs", config.get("full_bleu_eval_every_epochs", 0))
-    )
-    full_eval_phased = config.get("full_eval_phased")
-    dual_bleu = bool(config.get("dual_bleu_eval_optimized", False))
-    train_mode = str(config.get("train_mode", get_train_mode()))
-    min_lr_ratio = float(
-        config.get("min_lr_ratio", get_min_lr_ratio(config.get("task_idx"))),
-    )
-    warmup_steps_env = config.get("d4c_warmup_steps")
-    warmup_ratio_env = config.get("d4c_warmup_ratio")
+    _lg = final_cfg.logger
+    min_epochs = int(final_cfg.min_epochs)
+    early_stop_patience = int(final_cfg.early_stop_patience)
+    early_stop_patience_full = int(final_cfg.early_stop_patience_full)
+    early_stop_patience_loss = int(final_cfg.early_stop_patience_loss)
+    checkpoint_metric = str(final_cfg.checkpoint_metric)
+    bleu4_max_samples = int(final_cfg.bleu4_max_samples)
+    quick_eval_max_samples = int(final_cfg.quick_eval_max_samples)
+    valid_dataset_for_bleu = final_cfg.valid_dataset
+    lr_scheduler_type = str(final_cfg.lr_scheduler)
+    warmup_epochs = float(final_cfg.warmup_epochs)
+    full_eval_every = int(final_cfg.full_eval_every_epochs)
+    full_eval_phased = final_cfg.full_eval_phased
+    dual_bleu = bool(final_cfg.dual_bleu_eval)
+    min_lr_ratio = float(final_cfg.min_lr_ratio)
+    warmup_steps_env = final_cfg.d4c_warmup_steps
+    warmup_ratio_env = final_cfg.d4c_warmup_ratio
     total_steps_plan = max(1, int(epochs * n_steps))
     best_bleu4 = -1.0
     best_full_bleu4 = -1.0
@@ -853,7 +944,7 @@ def trainModel_ddp(
     prev_valid_loss = float("inf")
     if rank == 0:
         if _lg:
-            _lg.info(train_info)
+            _lg.info(train_info, extra=log_route_extra(_lg, ROUTE_SUMMARY))
         else:
             print(train_info, flush=True)
         _sched = (
@@ -866,22 +957,19 @@ def trainModel_ddp(
             f"early_stop_patience_full={early_stop_patience_full} (dual_bleu: full BLEU 未刷新 best), "
             f"early_stop_patience_loss={early_stop_patience_loss} (dual_bleu: valid_loss 连续变差), "
             f"checkpoint_metric={checkpoint_metric}, quick_eval_max_samples={quick_eval_max_samples}, "
-            f"full_bleu_schedule={_sched}, dual_bleu_eval_optimized={dual_bleu}"
+            f"full_bleu_schedule={_sched}, dual_bleu_eval={dual_bleu}"
         )
         if _lg:
-            _lg.info(_es)
+            _lg.info(_es, extra=log_route_extra(_lg, ROUTE_SUMMARY))
         else:
             print(_es, flush=True)
         if _lg:
             _lg.info(
-                "Train profile: mode=%s exact_reproduction=%s allow_large_batch=%s "
-                "lr_scheduler=%s warmup_epochs=%g full_bleu_schedule=%s",
-                get_train_mode(),
-                get_exact_reproduction(),
-                get_allow_large_batch(),
+                "Train profile: lr_scheduler=%s warmup_epochs=%g full_bleu_schedule=%s",
                 lr_scheduler_type,
                 warmup_epochs,
                 _sched,
+                extra=log_route_extra(_lg, ROUTE_SUMMARY),
             )
 
     optimizer = optim.Adam(model.parameters(), lr=initial_lr, weight_decay=1e-5)
@@ -897,7 +985,6 @@ def trainModel_ddp(
             explicit_steps=warmup_steps_env,
             explicit_ratio=warmup_ratio_env,
             warmup_epochs_fallback=warmup_epochs,
-            train_mode=train_mode,
         )
         lr_lambda = warmup_cosine_multiplier_lambda(ws_resolved, total_steps_plan, min_lr_ratio)
         sched = lr_sched.LambdaLR(optimizer, lr_lambda)
@@ -915,6 +1002,7 @@ def trainModel_ddp(
                 ws_resolved,
                 total_steps_plan,
                 warmup_ratio_logged,
+                extra=log_route_extra(_lg, ROUTE_SUMMARY),
             )
     adversarial_loss_fn = BCEWithLogitsLoss(label_smoothing=0.3)
     if rank == 0:
@@ -931,18 +1019,18 @@ def trainModel_ddp(
                 )
             )
             if _lg:
-                _lg.info(_adv_msg)
+                _lg.info(_adv_msg, extra=log_route_extra(_lg, ROUTE_SUMMARY))
             else:
                 print(_adv_msg, flush=True)
-    device_ids = config.get("device_ids") or [device]
+    device_ids = list(final_cfg.device_ids) if final_cfg.device_ids else [device]
     train_nw = getattr(train_dataloader, "num_workers", 0)
     valid_nw = getattr(valid_dataloader, "num_workers", 0) if valid_dataloader is not None else None
     perf = None
     if rank == 0:
         perf = PerfMonitor(
-            device=config["device"],
-            log_file=config.get("log_file"),
-            num_proc=config.get("num_proc"),
+            device=final_cfg.device,
+            log_file=final_cfg.log_file,
+            num_proc=final_cfg.num_proc,
             device_ids=device_ids,
             train_num_workers=train_nw,
             valid_num_workers=valid_nw,
@@ -951,9 +1039,12 @@ def trainModel_ddp(
         perf.start()
     step_count = 0
     global_step = 0
+    step_iv = max(1, d4c_log_step_interval())
+    grad_iv = max(1, d4c_log_grad_interval())
     try:
         for epoch in range(epochs):
             sampler.set_epoch(epoch)
+            valid_dataloader.sampler.set_epoch(epoch)
             epoch_1 = epoch + 1
             adv_coef_epoch = _effective_adversarial_coef_epoch(
                 epoch_1,
@@ -968,9 +1059,9 @@ def trainModel_ddp(
                 perf.epoch_start()
             model.train()
             discriminator.train()
-            loss_sum = 0.0
-            adv_sum = 0.0
-            n_samples = 0
+            loss_sum = torch.zeros((), dtype=torch.double, device=device)
+            adv_sum = torch.zeros((), dtype=torch.double, device=device)
+            n_samples = torch.zeros((), dtype=torch.double, device=device)
             micro_step_epoch = 0
             d_optimizer.zero_grad(set_to_none=True)
             optimizer.zero_grad(set_to_none=True)
@@ -985,6 +1076,7 @@ def trainModel_ddp(
                 sync_ctx = _ddp_no_sync_both(model, discriminator, world_size, sync)
                 user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = _model.gather(batch, device)
                 bsz = int(user_idx.size(0))
+                warn_empty_batch(_lg, global_step=global_step, epoch=epoch_1, bsz=bsz)
                 if use_adv:
                     # 同一微批上 D 与 G 的两次 backward 须在同一段 no_sync 内，避免中间触发规约
                     with sync_ctx:
@@ -1023,6 +1115,14 @@ def trainModel_ddp(
                         (loss * inv_accum).backward()
 
                     if sync:
+                        if (global_step + 1) % grad_iv == 0:
+                            log_grad_monitor(
+                                _lg,
+                                model,
+                                global_step=global_step + 1,
+                                epoch=epoch_1,
+                                route_detail=ROUTE_DETAIL,
+                            )
                         nn.utils.clip_grad_norm_(model.parameters(), 1)
                         d_optimizer.step()
                         optimizer.step()
@@ -1034,7 +1134,35 @@ def trainModel_ddp(
                         if d_sched is not None:
                             d_sched.step()
                         global_step += 1
-                    adv_sum += g_loss.item() * bsz
+                        maybe_log_grad_norm_diff_ddp(
+                            model,
+                            rank=rank,
+                            world_size=world_size,
+                            device=device,
+                            global_step=global_step,
+                            logger=_lg,
+                            route_detail=ROUTE_DETAIL,
+                        )
+                        if rank == 0 and _lg and global_step > 0 and global_step % step_iv == 0:
+                            _lr_now = optimizer.param_groups[0]["lr"]
+                            _extra = None
+                            if d4c_log_step_loss_parts():
+                                _extra = {
+                                    "loss_r": float(loss_r.detach().item()),
+                                    "loss_e": float(loss_e.detach().item()),
+                                    "loss_c": float(loss_c.detach().item()),
+                                    "d_loss": float(d_loss.detach().item()),
+                                    "g_loss": float(g_loss.detach().item()),
+                                }
+                            log_step_sample(
+                                _lg,
+                                global_step=global_step,
+                                epoch=epoch_1,
+                                lr=float(_lr_now),
+                                train_loss_batch=float(loss.detach().item()),
+                                extra=_extra,
+                            )
+                    adv_sum = adv_sum + g_loss.detach().double() * bsz
                 else:
                     with sync_ctx:
                         pred_rating, context_dist, word_dist, user_hidden, item_hidden = model(
@@ -1046,6 +1174,14 @@ def trainModel_ddp(
                         loss = 0.1 * loss_r + coef * loss_c + loss_e
                         (loss * inv_accum).backward()
                     if sync:
+                        if (global_step + 1) % grad_iv == 0:
+                            log_grad_monitor(
+                                _lg,
+                                model,
+                                global_step=global_step + 1,
+                                epoch=epoch_1,
+                                route_detail=ROUTE_DETAIL,
+                            )
                         nn.utils.clip_grad_norm_(model.parameters(), 1)
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
@@ -1053,25 +1189,55 @@ def trainModel_ddp(
                         if sched is not None:
                             sched.step()
                         global_step += 1
+                        maybe_log_grad_norm_diff_ddp(
+                            model,
+                            rank=rank,
+                            world_size=world_size,
+                            device=device,
+                            global_step=global_step,
+                            logger=_lg,
+                            route_detail=ROUTE_DETAIL,
+                        )
+                        if rank == 0 and _lg and global_step > 0 and global_step % step_iv == 0:
+                            _lr_now = optimizer.param_groups[0]["lr"]
+                            _extra = None
+                            if d4c_log_step_loss_parts():
+                                _extra = {
+                                    "loss_r": float(loss_r.detach().item()),
+                                    "loss_e": float(loss_e.detach().item()),
+                                    "loss_c": float(loss_c.detach().item()),
+                                }
+                            log_step_sample(
+                                _lg,
+                                global_step=global_step,
+                                epoch=epoch_1,
+                                lr=float(_lr_now),
+                                train_loss_batch=float(loss.detach().item()),
+                                extra=_extra,
+                            )
 
-                loss_sum += loss.item() * bsz
+                loss_sum = loss_sum + loss.detach().double() * bsz
                 n_samples += bsz
+                if step_count % step_iv == 0 and rank == 0:
+                    check_finite_loss(loss, _lg, global_step=global_step, epoch=epoch_1)
+                    check_finite_tensor(word_dist, _lg, name="word_dist", global_step=global_step, epoch=epoch_1)
 
                 # 用于快速验证：跑到指定 steps 后直接退出，观察是否触发 DDP reduction 错误
                 if max_steps is not None and step_count >= max_steps:
                     return
 
-            t_ls = torch.tensor([loss_sum], dtype=torch.double, device=device)
-            t_as = torch.tensor([adv_sum], dtype=torch.double, device=device)
-            t_ns = torch.tensor([float(n_samples)], dtype=torch.double, device=device)
-            dist.all_reduce(t_ls, op=dist.ReduceOp.SUM)
-            dist.all_reduce(t_as, op=dist.ReduceOp.SUM)
-            dist.all_reduce(t_ns, op=dist.ReduceOp.SUM)
-            avg_loss = t_ls.item() / t_ns.item()
-            avg_adv_loss = t_as.item() / t_ns.item()
+            ddp_heartbeat(_lg, "before_train_loss_allreduce", rank=rank, epoch=epoch_1)
+            dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(adv_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(n_samples, op=dist.ReduceOp.SUM)
+            ddp_heartbeat(_lg, "after_train_loss_allreduce", rank=rank, epoch=epoch_1)
+            avg_loss = (loss_sum / n_samples).item()
+            avg_adv_loss = (adv_sum / n_samples).item()
 
             lr_epoch = optimizer.param_groups[0]["lr"]
+            ddp_heartbeat(_lg, "before_gpu_stats_allgather", rank=rank, epoch=epoch_1)
             _gu, _gm, _gpeak = gather_ddp_gpu_stats_for_epoch_log(rank, world_size, int(device))
+            ddp_heartbeat(_lg, "after_gpu_stats_allgather", rank=rank, epoch=epoch_1)
             if rank == 0:
                 rec = perf.epoch_end(epoch + 1, len(train_dataloader), emit_log=False)
                 rec["gpu_util"] = _gu
@@ -1081,13 +1247,23 @@ def trainModel_ddp(
             else:
                 rec = None
 
-            # 每个 rank 都跑自己的 valid shard，然后 all_reduce 聚合为全局“按 batch 平均”的 valid loss。
-            valid_loss_sum, valid_n_batches = validModel_sum_batches(model, valid_dataloader, device)
-            t_ls = torch.tensor([valid_loss_sum], dtype=torch.double, device=device)
-            t_nb = torch.tensor([float(valid_n_batches)], dtype=torch.double, device=device)
-            dist.all_reduce(t_ls, op=dist.ReduceOp.SUM)
-            dist.all_reduce(t_nb, op=dist.ReduceOp.SUM)
-            current_valid_loss = float(t_ls.item() / t_nb.item())
+            # 各 rank valid 分片上样本加权求和，一次 all_reduce 得全局 avg valid loss（与 train / Step5 一致）。
+            _t_valid0 = time.perf_counter()
+            valid_loss_sum, valid_n_samples = validModel_sum_batches(model, valid_dataloader, device)
+            if rank == 0 and _lg:
+                _lg.info(
+                    "[Timing] valid_loss_forward end epoch=%d elapsed_s=%.3f",
+                    epoch_1,
+                    time.perf_counter() - _t_valid0,
+                    extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                )
+            v_stat = torch.tensor(
+                [valid_loss_sum, float(valid_n_samples)],
+                dtype=torch.double,
+                device=device,
+            )
+            dist.all_reduce(v_stat, op=dist.ReduceOp.SUM)
+            current_valid_loss = float(v_stat[0] / v_stat[1]) if v_stat[1] > 0 else 0.0
 
             bleu4_score_this_epoch = None
             quick_bleu4 = None
@@ -1099,13 +1275,25 @@ def trainModel_ddp(
             )
             if checkpoint_metric == "bleu4" and valid_dataset_for_bleu is not None:
                 if rank == 0:
-                    quick_bleu4 = _valid_bleu4_quick(
-                        model, valid_dataset_for_bleu, device, quick_eval_max_samples
-                    )
+                    with d4c_timing_phase(
+                        _lg,
+                        f"bleu_quick_epoch_{epoch_1}",
+                        route=ROUTE_SUMMARY,
+                        rank=0,
+                    ):
+                        quick_bleu4 = _valid_bleu4_quick(
+                            model,
+                            valid_dataset_for_bleu,
+                            device,
+                            quick_eval_max_samples,
+                            dataloader_num_workers=min(2, final_cfg.dataloader_num_workers_valid),
+                            dataloader_prefetch_factor=final_cfg.dataloader_prefetch_factor_valid,
+                        )
                     bleu4_score_this_epoch = quick_bleu4
                 if world_size > 1:
                     dist.barrier()
                 if is_full_eval_epoch:
+                    _t_full_bleu = time.perf_counter()
                     full_bleu4_val = bleu4_explanation_full_valid_ddp(
                         model,
                         valid_dataset_for_bleu,
@@ -1114,7 +1302,16 @@ def trainModel_ddp(
                         rank=rank,
                         world_size=world_size,
                         batch_size=32,
+                        dataloader_num_workers=min(2, final_cfg.dataloader_num_workers_valid),
+                        dataloader_prefetch_factor=final_cfg.dataloader_prefetch_factor_valid,
                     )
+                    if rank == 0 and _lg:
+                        _lg.info(
+                            "[Timing] bleu_full_valid_ddp end epoch=%d elapsed_s=%.3f",
+                            epoch_1,
+                            time.perf_counter() - _t_full_bleu,
+                            extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                        )
             if rank == 0:
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 bleu_line = None
@@ -1177,7 +1374,13 @@ def trainModel_ddp(
                 else:
                     valid_loss_stall = 0
                     if checkpoint_metric == "loss" and rank == 0:
-                        torch.save(get_underlying_model(model).state_dict(), config.get("save_file"))
+                        d4c_save_checkpoint(
+                            get_underlying_model(model).state_dict(),
+                            str(final_cfg.save_file),
+                            epoch=epoch_1,
+                            reason="checkpoint_metric_loss_improved",
+                            logger=_lg,
+                        )
             else:
                 if current_valid_loss > prev_valid_loss:
                     enduration += 1
@@ -1190,7 +1393,13 @@ def trainModel_ddp(
                 else:
                     enduration = 0
                     if checkpoint_metric == "loss" and rank == 0:
-                        torch.save(get_underlying_model(model).state_dict(), config.get("save_file"))
+                        d4c_save_checkpoint(
+                            get_underlying_model(model).state_dict(),
+                            str(final_cfg.save_file),
+                            epoch=epoch_1,
+                            reason="checkpoint_metric_loss_improved",
+                            logger=_lg,
+                        )
             prev_valid_loss = current_valid_loss
 
             if (
@@ -1203,7 +1412,13 @@ def trainModel_ddp(
                     best_full_bleu4 = full_bleu4_val
                     full_eval_stall = 0
                     if rank == 0:
-                        torch.save(get_underlying_model(model).state_dict(), config.get("save_file"))
+                        d4c_save_checkpoint(
+                            get_underlying_model(model).state_dict(),
+                            str(final_cfg.save_file),
+                            epoch=epoch_1,
+                            reason="dual_bleu_full_bleu_improved",
+                            logger=_lg,
+                        )
                 else:
                     # quick BLEU 不参与早停；仅在达到 min_epochs 后，对「未刷新 best 的 full eval」计数
                     if epoch + 1 >= min_epochs:
@@ -1217,7 +1432,13 @@ def trainModel_ddp(
                 and bleu4_score_this_epoch > best_bleu4
             ):
                 best_bleu4 = bleu4_score_this_epoch
-                torch.save(get_underlying_model(model).state_dict(), config.get("save_file"))
+                d4c_save_checkpoint(
+                    get_underlying_model(model).state_dict(),
+                    str(final_cfg.save_file),
+                    epoch=epoch_1,
+                    reason="bleu_quick_improved",
+                    logger=_lg,
+                )
 
             if rank == 0 and dual_bleu and checkpoint_metric == "bleu4":
                 _cur_full = (
@@ -1237,11 +1458,13 @@ def trainModel_ddp(
                     f"epoch={epoch + 1} min_epochs={min_epochs} should_stop={_should_stop}"
                 )
                 if _lg:
-                    _lg.info(_es_line)
+                    _lg.info(_es_line, extra=log_route_extra(_lg, ROUTE_SUMMARY))
                 else:
                     print(_es_line, flush=True)
 
+            ddp_heartbeat(_lg, "before_epoch_end_barrier", rank=rank, epoch=epoch_1)
             dist.barrier()
+            ddp_heartbeat(_lg, "after_epoch_end_barrier", rank=rank, epoch=epoch_1)
 
             if dual_bleu and checkpoint_metric == "bleu4":
                 if (epoch + 1) >= min_epochs and (
@@ -1254,6 +1477,18 @@ def trainModel_ddp(
     finally:
         if rank == 0 and perf is not None:
             perf.finish()
+        if save_final_checkpoint and rank == 0:
+            _sf = os.path.abspath(str(final_cfg.save_file))
+            _dir = os.path.dirname(_sf)
+            if _dir:
+                os.makedirs(_dir, exist_ok=True)
+            d4c_save_checkpoint(
+                get_underlying_model(model).state_dict(),
+                _sf,
+                epoch=int(epochs),
+                reason="save_final_checkpoint",
+                logger=_lg,
+            )
 
 
 def _eval_collect_shard_predictions(model, test_dataloader, device):
@@ -1292,21 +1527,8 @@ def evalModel(model, test_dataloader, device):
     return metrics_from_eval_lists(pr, gt, pe, re)
 
 
-def build_config_and_dataloader(args, ddp_rank=None, ddp_world_size=None, local_rank=None):
-    use_eval_ddp = ddp_world_size is not None
-    if use_eval_ddp:
-        if ddp_rank is None or local_rank is None:
-            raise ValueError("DDP eval 须同时提供 ddp_rank 与 local_rank")
-        if args.gpus and ddp_rank == 0:
-            logging.warning("torchrun eval DDP 下忽略 --gpus，请用 CUDA_VISIBLE_DEVICES 指定可见 GPU。")
-        device_ids = [local_rank]
-        primary_device = local_rank
-    elif args.gpus:
-        device_ids = [int(x.strip()) for x in args.gpus.split(",")]
-        primary_device = device_ids[0]
-    else:
-        device_ids = [args.device]
-        primary_device = args.device
+def build_config_and_dataloader(args, ddp_rank: int, ddp_world_size: int, local_rank: int):
+    primary_device = local_rank
 
     task_idx = None
     for idx, (aux, tgt) in enumerate(tasks):
@@ -1324,14 +1546,11 @@ def build_config_and_dataloader(args, ddp_rank=None, ddp_world_size=None, local_
     batch_size = args.batch_size if args.batch_size is not None else get_eval_batch_size()
     nproc = args.num_proc if args.num_proc is not None else get_num_proc()
 
-    if use_eval_ddp:
-        if batch_size % ddp_world_size != 0:
-            raise ValueError(
-                f"DDP eval 要求全局 batch_size ({batch_size}) 能被进程数 ({ddp_world_size}) 整除，请调整 --batch-size。"
-            )
-        loader_batch_size = batch_size // ddp_world_size
-    else:
-        loader_batch_size = batch_size
+    if batch_size % ddp_world_size != 0:
+        raise ValueError(
+            f"DDP eval 要求全局 batch_size ({batch_size}) 能被进程数 ({ddp_world_size}) 整除，请调整 --batch-size。"
+        )
+    loader_batch_size = batch_size // ddp_world_size
 
     config = {
         "task_idx": task_idx,
@@ -1348,62 +1567,61 @@ def build_config_and_dataloader(args, ddp_rank=None, ddp_world_size=None, local_
         "nitem": nitem,
         "nhead": 2
     }
-    if use_eval_ddp:
-        config["batch_size_global"] = batch_size
+    config["batch_size_global"] = batch_size
 
-    valid_df = pd.read_csv(path + "/aug_valid.csv")
+    valid_path = os.path.join(path, "aug_valid.csv")
+    valid_df = pd.read_csv(valid_path)
     valid_df['item'] = valid_df['item'].astype(str)
     datasets = DatasetDict({
         "valid": Dataset.from_pandas(valid_df)
     })
     processor = Processor(args.auxiliary, args.target)
-    t0 = time.perf_counter()
-    with hf_datasets_progress_bar(ddp_rank is None or ddp_rank == 0):
-        encoded_data = datasets.map(lambda sample: processor(sample), num_proc=nproc, desc="Tokenize")
-    if ddp_rank is None or ddp_rank == 0:
-        _log_tokenize_done(
-            "eval valid",
-            nproc,
-            time.perf_counter() - t0,
+    cache_dir, cache_fp = _build_step3_eval_cache_dir(
+        task_idx=int(task_idx),
+        eval_data_path=os.path.abspath(valid_path),
+        processor=processor,
+        tok=tokenizer,
+    )
+    if ddp_rank == 0:
+        _log_tokenize_cache_line(
+            f"[Tokenize] eval valid cache key | fingerprint={cache_fp} | cache_dir={cache_dir}",
             getattr(args, "log_file", None),
         )
+    encoded_data = _map_tokenize_train_valid_to_hf_cache(
+        datasets=datasets,
+        processor=processor,
+        nproc=nproc,
+        cache_dir=cache_dir,
+        cache_fingerprint=cache_fp,
+        rank=ddp_rank,
+        show_datasets_progress=(ddp_rank == 0),
+        log_tokenize=(ddp_rank == 0),
+        phase="eval valid",
+        log_file=getattr(args, "log_file", None),
+    )
     encoded_data.set_format("torch")
     valid_dataset = TensorDataset(
         encoded_data['valid']['user_idx'], encoded_data['valid']['item_idx'],
         encoded_data['valid']['rating'], encoded_data['valid']['explanation_idx'],
         encoded_data['valid']['domain_idx']
     )
-    if use_eval_ddp:
-        n_samples = len(valid_dataset)
-        shard_idx = list(range(ddp_rank, n_samples, ddp_world_size))
-        valid_dataset = Subset(valid_dataset, shard_idx)
-        eval_world_size = max(ddp_world_size, 1)
-        dl_valid = get_dataloader_num_workers("valid")
-        num_workers = min(max(1, dl_valid // eval_world_size), 8)
-        pin_memory = torch.cuda.is_available()
-        _pf_ev = get_dataloader_prefetch_factor(num_workers)
-        valid_dataloader = DataLoader(
-            valid_dataset,
-            batch_size=loader_batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=num_workers > 0,
-            prefetch_factor=_pf_ev,
-        )
-    else:
-        num_workers = min(get_dataloader_num_workers("valid"), 8)
-        pin_memory = torch.cuda.is_available()
-        _pf_ev = get_dataloader_prefetch_factor(num_workers)
-        valid_dataloader = DataLoader(
-            valid_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=num_workers > 0,
-            prefetch_factor=_pf_ev,
-        )
+    n_samples = len(valid_dataset)
+    shard_idx = list(range(ddp_rank, n_samples, ddp_world_size))
+    valid_dataset = Subset(valid_dataset, shard_idx)
+    eval_world_size = max(ddp_world_size, 1)
+    dl_valid = get_dataloader_num_workers("valid")
+    num_workers = min(max(1, dl_valid // eval_world_size), 8)
+    pin_memory = torch.cuda.is_available()
+    _pf_ev = get_dataloader_prefetch_factor(num_workers, split="valid")
+    valid_dataloader = DataLoader(
+        valid_dataset,
+        batch_size=loader_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=_pf_ev,
+    )
 
     suser_profiles = torch.tensor(np.load(os.path.join(DATA_DIR, args.auxiliary, "user_profiles.npy")), dtype=torch.float)
     sitem_profiles = torch.tensor(np.load(os.path.join(DATA_DIR, args.auxiliary, "item_profiles.npy")), dtype=torch.float)
@@ -1425,43 +1643,17 @@ def build_config_and_dataloader(args, ddp_rank=None, ddp_world_size=None, local_
     _map = f"cuda:{config.get('device')}" if torch.cuda.is_available() else "cpu"
     model.load_state_dict(torch.load(config.get("save_file"), map_location=_map, weights_only=True))
     model = model.to(config.get("device"))
-    if not use_eval_ddp and len(device_ids) > 1:
-        model = nn.DataParallel(model, device_ids=device_ids)
 
     return config, valid_dataloader, model
 
 
 def _run_train_ddp(args):
-    if getattr(args, "train_mode", None):
-        os.environ["D4C_TRAIN_MODE"] = str(args.train_mode).strip().lower()
-    if getattr(args, "scheduler_initial_lr", None) is not None:
-        os.environ["D4C_INITIAL_LR"] = str(args.scheduler_initial_lr)
-    if getattr(args, "warmup_steps", None) is not None:
-        os.environ["D4C_WARMUP_STEPS"] = str(args.warmup_steps)
-    if getattr(args, "warmup_ratio", None) is not None:
-        os.environ["D4C_WARMUP_RATIO"] = str(args.warmup_ratio)
-    if getattr(args, "min_lr_ratio", None) is not None:
-        os.environ["D4C_MIN_LR_RATIO"] = str(args.min_lr_ratio)
-    if getattr(args, "quick_eval_max_samples", None) is not None:
-        os.environ["D4C_QUICK_EVAL_MAX_SAMPLES"] = str(args.quick_eval_max_samples)
-    if getattr(args, "full_eval_every", None) is not None:
-        os.environ["D4C_FULL_EVAL_EVERY"] = str(args.full_eval_every)
-    if getattr(args, "early_stop_patience_full", None) is not None:
-        os.environ["TRAIN_EARLY_STOP_PATIENCE_FULL"] = str(args.early_stop_patience_full)
-    if getattr(args, "early_stop_patience_loss", None) is not None:
-        os.environ["TRAIN_EARLY_STOP_PATIENCE_LOSS"] = str(args.early_stop_patience_loss)
-    if getattr(args, "adversarial_start_epoch", None) is not None:
-        os.environ["D4C_ADVERSARIAL_START_EPOCH"] = str(args.adversarial_start_epoch)
-    if getattr(args, "adversarial_warmup_epochs", None) is not None:
-        os.environ["D4C_ADVERSARIAL_WARMUP_EPOCHS"] = str(args.adversarial_warmup_epochs)
-    if getattr(args, "adversarial_coef_target", None) is not None:
-        os.environ["D4C_ADVERSARIAL_COEF_TARGET"] = str(args.adversarial_coef_target)
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
     torch.cuda.set_device(local_rank)
-    ddp_fast_backends = apply_optimized_torch_backends()
+    ddp_fast_backends = apply_ddp_fast_torch_backends()
     dist.init_process_group(backend="nccl")
 
     torch.manual_seed(args.seed)
@@ -1501,68 +1693,69 @@ def _run_train_ddp(args):
     train_logger = _setup["logger"]
 
     try:
-        config, train_dataloader, valid_dataloader, model, discriminator, sampler = build_config_and_data_ddp(
+        base_final, train_dataloader, valid_dataloader, model, discriminator, sampler = build_config_and_data_ddp(
             args, rank, world_size, local_rank,
         )
-        config["run_id"] = run_id
-        config["logger"] = train_logger
-        config["train_mode"] = get_train_mode()
-        config["exact_reproduction"] = get_exact_reproduction()
-        config["allow_large_batch"] = get_allow_large_batch()
-        config["lr_scheduler"] = get_lr_scheduler_type()
-        config["scheduler_type"] = config["lr_scheduler"]
-        config["warmup_epochs"] = get_warmup_epochs()
-        config["scheduler_initial_lr"] = get_scheduler_initial_lr(args.learning_rate)
-        config["min_lr_ratio"] = get_min_lr_ratio(task_idx)
-        config["d4c_warmup_steps"] = get_d4c_warmup_steps_optional()
-        config["d4c_warmup_ratio"] = get_d4c_warmup_ratio_optional()
-        config["ddp_fast_backends"] = ddp_fast_backends
-        if rank == 0:
-            log_run_header(
-                train_logger,
-                {
-                    "mode": get_train_mode(),
-                    "exact_reproduction": get_exact_reproduction(),
-                    "allow_large_batch": get_allow_large_batch(),
-                    "run_id": run_id,
-                    "task_idx": task_idx,
-                    "rank": rank,
-                    "world_size": world_size,
-                    "cuda_available": bool(torch.cuda.is_available()),
-                    "local_rank": local_rank,
-                    "learning_rate": config["learning_rate"],
-                    "batch_size": config.get("batch_size_global", config.get("batch_size")),
-                    "batch_size_global": config.get("batch_size_global"),
-                    "per_device_batch_size": config.get("per_device_batch_size"),
-                    "gradient_accumulation_steps": config.get("gradient_accumulation_steps"),
-                    "effective_global_batch_size": config.get("effective_global_batch_size"),
-                    "epochs": config["epochs"],
-                    "save_file": os.path.abspath(str(config.get("save_file", ""))),
-                    "log_file": os.path.abspath(log_path),
-                    "auxiliary": args.auxiliary,
-                    "target": args.target,
-                },
-            )
-            log_config_snapshot(train_logger, config)
-
-        trainModel_ddp(
-            model,
-            discriminator,
-            train_dataloader,
-            valid_dataloader,
-            sampler,
-            config,
-            rank,
-            world_size,
-            max_steps=getattr(args, "max_steps", None),
+        final_cfg = replace(
+            base_final,
+            run_id=run_id,
+            logger=train_logger,
+            log_file=log_path,
+            ddp_fast_backends=ddp_fast_backends,
         )
+        if rank == 0:
+            _meta = {
+                "run_id": run_id,
+                "task_idx": task_idx,
+                "rank": rank,
+                "world_size": world_size,
+                "cuda_available": bool(torch.cuda.is_available()),
+                "local_rank": local_rank,
+                "learning_rate": final_cfg.learning_rate,
+                "batch_size": final_cfg.train_batch_size,
+                "batch_size_global": final_cfg.batch_size_global,
+                "per_device_batch_size": final_cfg.per_device_train_batch_size,
+                "gradient_accumulation_steps": final_cfg.gradient_accumulation_steps,
+                "effective_global_batch_size": final_cfg.effective_global_batch_size,
+                "epochs": final_cfg.epochs,
+                "save_file": os.path.abspath(str(final_cfg.save_file)),
+                "log_file": os.path.abspath(log_path),
+                "auxiliary": args.auxiliary,
+                "target": args.target,
+                "distributed_env": collect_distributed_env_for_meta(),
+            }
+            log_run_header(train_logger, _meta)
+            log_config_snapshot(train_logger, final_cfg.to_log_dict())
+            flush_preset_load_events(train_logger)
+
+        try:
+            trainModel_ddp(
+                model,
+                discriminator,
+                train_dataloader,
+                valid_dataloader,
+                sampler,
+                final_cfg,
+                rank,
+                world_size,
+                max_steps=getattr(args, "max_steps", None),
+                save_final_checkpoint=bool(getattr(args, "save_final_checkpoint", False)),
+            )
+        except Exception as exc:
+            if rank == 0:
+                log_training_crash(train_logger, exc)
+            raise
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
 
 
-def _eval_torchrun_env():
-    return "LOCAL_RANK" in os.environ and "WORLD_SIZE" in os.environ
+def _eval_torchrun_env() -> bool:
+    return (
+        "LOCAL_RANK" in os.environ
+        and "RANK" in os.environ
+        and "WORLD_SIZE" in os.environ
+    )
 
 
 def _write_eval_results_log(
@@ -1601,72 +1794,6 @@ def _write_eval_results_log(
         lg.info("(eval 指标已写入 %s)", os.path.abspath(log_path) if log_path else log_path)
     else:
         logging.info("(eval 指标已写入 %s)", os.path.abspath(log_path) if log_path else log_path)
-
-
-def _run_eval_single(args):
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        primary = int(args.gpus.split(",")[0].strip()) if args.gpus else args.device
-        _ = torch.zeros(1, device=f"cuda:{primary}")
-
-    task_idx = None
-    for idx, (aux, tgt) in enumerate(tasks):
-        if aux == args.auxiliary and tgt == args.target:
-            task_idx = idx + 1
-            break
-    if task_idx is None:
-        raise ValueError("未知的 auxiliary/target 组合")
-    log_path, run_id = create_run_paths(task_idx, args.log_file)
-    args.log_file = log_path
-    _setup = setup_train_logging(
-        log_file=log_path,
-        task_idx=task_idx,
-        rank=0,
-        world_size=1,
-        run_id=run_id,
-    )
-    ev_logger = _setup["logger"]
-
-    config, valid_dataloader, model = build_config_and_dataloader(args)
-    config["logger"] = ev_logger
-    config["run_id"] = run_id
-    log_run_header(
-        ev_logger,
-        {
-            "run_id": run_id,
-            "task_idx": task_idx,
-            "rank": 0,
-            "world_size": 1,
-            "mode": "eval",
-            "cuda_available": bool(torch.cuda.is_available()),
-            "learning_rate": None,
-            "batch_size": config.get("batch_size_global", config.get("batch_size")),
-            "save_file": os.path.abspath(str(config.get("save_file", ""))),
-            "log_file": os.path.abspath(log_path),
-            "auxiliary": args.auxiliary,
-            "target": args.target,
-        },
-    )
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(config["device"])
-
-    _eval_t0 = time.time()
-    _eval_start_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    final = evalModel(model, valid_dataloader, config.get("device"))
-    _eval_elapsed = time.time() - _eval_t0
-    _td = f"Step 3 AdvTrain eval Task {task_idx}: {args.auxiliary} -> {args.target}"
-    _write_eval_results_log(
-        config,
-        final,
-        task_description=_td,
-        pipeline="AdvTrain_eval",
-        domain_from=args.auxiliary,
-        domain_to=args.target,
-        start_time=_eval_start_str,
-        eval_elapsed=_eval_elapsed,
-    )
-    ev_logger.info("DONE.")
 
 
 def _run_eval_ddp(args):
@@ -1776,12 +1903,11 @@ def _run_eval_ddp(args):
 
 
 def _dispatch_eval(args):
-    if _eval_torchrun_env():
-        if not torch.cuda.is_available():
-            raise RuntimeError("检测到 torchrun 环境但无 CUDA，无法使用 eval DDP。")
-        _run_eval_ddp(args)
-    else:
-        _run_eval_single(args)
+    if not _eval_torchrun_env():
+        raise RuntimeError(_EVAL_REQUIRES_TORCHRUN_MSG)
+    if not torch.cuda.is_available():
+        raise RuntimeError("检测到分布式启动环境但无 CUDA，无法使用 eval DDP（需要 CUDA + NCCL）。")
+    _run_eval_ddp(args)
 
 
 def _add_train_args(p):
@@ -1794,13 +1920,28 @@ def _add_train_args(p):
     p.add_argument("--device", type=int, default=0, help="DDP 下以 LOCAL_RANK 为准，可忽略")
     p.add_argument("--auxiliary", type=str, required=True)
     p.add_argument("--target", type=str, required=True)
-    p.add_argument("--learning_rate", type=float, default=1e-3)
+    p.add_argument(
+        "--learning_rate",
+        type=float,
+        default=None,
+        help="学习率；不传则由 build_resolved_training_config 按 BASE→TASK→预设→ENV→CLI 解析",
+    )
     p.add_argument("--save_file", type=str, default=None)
     p.add_argument("--epochs", type=int, default=None, help="不传则用 config.epochs")
-    p.add_argument("--coef", type=float, default=0.5)
+    p.add_argument(
+        "--coef",
+        type=float,
+        default=None,
+        help="不传则由 resolve：TASK_DEFAULTS / 命名预设 / ENV / CLI 覆盖链决定",
+    )
     p.add_argument("--nlayers", type=int, default=2)
     p.add_argument("--seed", type=int, default=3407)
-    p.add_argument("--adv", type=float, default=1.0)
+    p.add_argument(
+        "--adv",
+        type=float,
+        default=None,
+        help="对抗系数；不传则由 resolve（task / preset / CLI）决定",
+    )
     p.add_argument(
         "--adversarial-start-epoch",
         type=int,
@@ -1844,8 +1985,13 @@ def _add_train_args(p):
         help="单卡 DataLoader 微批；显存不足时减小并配合全局 G 推出 accum；或 D4C_PER_DEVICE_BATCH_SIZE",
     )
     p.add_argument("--num-proc", type=int, default=None)
-    p.add_argument("--gpus", type=str, default=None, help="兼容保留；train 的 GPU 由 torchrun 分配")
     p.add_argument("--max-steps", type=int, default=None, help="快速验证用：最多训练到 N 个 batch 就退出")
+    p.add_argument(
+        "--save-final-checkpoint",
+        action="store_true",
+        help="训练进程退出时（含 --max-steps 提前结束）由 rank0 无条件写入 save_file；"
+        "不改变 loss/BLEU 选模逻辑。适用于 smoke / debug；正式训练默认关闭。",
+    )
     p.add_argument(
         "--min-epochs",
         type=int,
@@ -1862,14 +2008,14 @@ def _add_train_args(p):
         "--early-stop-patience-full",
         type=int,
         default=None,
-        help="optimized+dual_bleu 时：连续多少次 full BLEU eval 未刷新 best 则早停（quick 不参与）；"
+        help="dual_bleu 时：连续多少次 full BLEU eval 未刷新 best 则早停（quick 不参与）；"
         "默认 TRAIN_EARLY_STOP_PATIENCE_FULL 或与 --early-stop-patience 相同",
     )
     p.add_argument(
         "--early-stop-patience-loss",
         type=int,
         default=None,
-        help="optimized+dual_bleu：valid_loss 连续变差早停次数，与 patience_full 独立；"
+        help="dual_bleu：valid_loss 连续变差早停次数，与 patience_full 独立；"
         "默认 TRAIN_EARLY_STOP_PATIENCE_LOSS 或同 --early-stop-patience",
     )
     p.add_argument(
@@ -1886,17 +2032,10 @@ def _add_train_args(p):
         help="按 BLEU-4 选模时验证集最多采样条数；默认 TRAIN_BLEU4_MAX_SAMPLES",
     )
     p.add_argument(
-        "--train-mode",
-        type=str,
-        choices=["reproduction", "optimized"],
-        default=None,
-        help="训练模式：reproduction 论文复现；optimized 工程优化（等价 export D4C_TRAIN_MODE）",
-    )
-    p.add_argument(
         "--scheduler-initial-lr",
         type=float,
         default=None,
-        help="优化器初始 LR，覆盖 --learning_rate；等价 D4C_INITIAL_LR",
+        help="优化器初始 LR；若设置则覆盖 --learning_rate（均在 resolve 内处理）",
     )
     p.add_argument(
         "--warmup-steps",
@@ -1926,7 +2065,7 @@ def _add_train_args(p):
         "--full-eval-every",
         type=int,
         default=None,
-        help="每 N epoch full valid BLEU；不设且未 export D4C_FULL_EVAL_EVERY 时 optimized 用分阶段默认",
+        help="每 N epoch full valid BLEU；不设且未 export D4C_FULL_EVAL_EVERY 时用分阶段默认",
     )
     p.add_argument(
         "--ddp-find-unused-parameters",
@@ -1951,15 +2090,28 @@ def _add_eval_args(p):
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--num-proc", type=int, default=None)
-    p.add_argument("--gpus", type=str, default=None, help="仅单进程 eval：多卡时用 DataParallel；torchrun eval 下忽略")
+
+
+def _reject_legacy_gpus_argv(argv):
+    """--gpus 已从 CLI 移除；若仍传入则显式失败，避免误以为仍生效。"""
+    for arg in argv[1:]:
+        if arg == "--gpus" or arg.startswith("--gpus="):
+            sys.stderr.write(
+                "AdvTrain.py: error: --gpus has been removed.\n"
+                "Use CUDA_VISIBLE_DEVICES to pin visible GPUs and set torchrun "
+                "--standalone --nproc_per_node=<num_visible_gpus> accordingly.\n"
+                "Single-GPU DDP smoke: torchrun --standalone --nproc_per_node=1 AdvTrain.py ...\n"
+            )
+            raise SystemExit(2)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AdvTrain：train（需 torchrun）| eval")
+    _reject_legacy_gpus_argv(sys.argv)
+    parser = argparse.ArgumentParser(description="AdvTrain：train / eval 均须 torchrun（eval 含 nproc=1 smoke）")
     sub = parser.add_subparsers(dest="command", required=True)
     p_train = sub.add_parser("train", help="DDP 域对抗预训练，须 torchrun 启动")
     _add_train_args(p_train)
-    p_eval = sub.add_parser("eval", help="valid 评估：python 单进程，或 torchrun 多卡 DDP")
+    p_eval = sub.add_parser("eval", help="valid 评估：须 torchrun DDP（可与 train 相同 nproc，含 1）")
     _add_eval_args(p_eval)
     args = parser.parse_args()
     if args.command == "train":

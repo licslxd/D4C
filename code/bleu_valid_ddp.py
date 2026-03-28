@@ -2,16 +2,13 @@
 """验证集 explanation BLEU-4：DDP 下全量分片推理 + rank0 聚合算分。"""
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, List, Optional
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Subset
 
 from base_utils import compute_bleu1234_only, get_underlying_model
-from config import get_dataloader_num_workers, get_dataloader_prefetch_factor
-
-
 def bleu4_explanation_full_valid_ddp(
     model: torch.nn.Module,
     valid_dataset,
@@ -21,6 +18,8 @@ def bleu4_explanation_full_valid_ddp(
     rank: int,
     world_size: int,
     batch_size: int = 32,
+    dataloader_num_workers: int = 2,
+    dataloader_prefetch_factor: Optional[int] = 4,
 ) -> float:
     """
     在完整 valid 上计算 explanation BLEU-4（词级，与 compute_bleu1234_only 一致）。
@@ -33,14 +32,32 @@ def bleu4_explanation_full_valid_ddp(
         return 0.0
 
     if world_size <= 1:
-        return _bleu4_subset_local(_m, valid_dataset, list(range(n)), device, tokenizer, batch_size)
+        return _bleu4_subset_local(
+            _m,
+            valid_dataset,
+            list(range(n)),
+            device,
+            tokenizer,
+            batch_size,
+            dataloader_num_workers=dataloader_num_workers,
+            dataloader_prefetch_factor=dataloader_prefetch_factor,
+        )
 
     chunk = (n + world_size - 1) // world_size
     start = rank * chunk
     end = min(n, start + chunk)
     indices: List[int] = list(range(start, end)) if start < n else []
 
-    pred_texts, ref_texts = _bleu4_collect_shard(_m, valid_dataset, indices, device, tokenizer, batch_size)
+    pred_texts, ref_texts = _bleu4_collect_shard(
+        _m,
+        valid_dataset,
+        indices,
+        device,
+        tokenizer,
+        batch_size,
+        dataloader_num_workers=dataloader_num_workers,
+        dataloader_prefetch_factor=dataloader_prefetch_factor,
+    )
     payload = {"preds": pred_texts, "refs": ref_texts}
     gathered: List[Any] = [None] * world_size
     dist.all_gather_object(gathered, payload)
@@ -65,14 +82,24 @@ def bleu4_explanation_full_valid_ddp(
     return float(t[0].item())
 
 
-def _bleu4_subset_local(_m, valid_dataset, indices: List[int], device: int, tokenizer, batch_size: int) -> float:
+def _bleu4_subset_local(
+    _m,
+    valid_dataset,
+    indices: List[int],
+    device: int,
+    tokenizer,
+    batch_size: int,
+    *,
+    dataloader_num_workers: int,
+    dataloader_prefetch_factor: Optional[int],
+) -> float:
     if not indices:
         return 0.0
     subset = Subset(valid_dataset, indices)
     n = len(subset)
     bs = max(1, min(int(batch_size), n))
-    _vn = min(2, get_dataloader_num_workers("valid"))
-    _pf = get_dataloader_prefetch_factor(_vn)
+    _vn = max(0, int(dataloader_num_workers))
+    _pf = dataloader_prefetch_factor if _vn > 0 else None
     dl = DataLoader(
         subset,
         batch_size=bs,
@@ -94,14 +121,24 @@ def _bleu4_subset_local(_m, valid_dataset, indices: List[int], device: int, toke
     return float(compute_bleu1234_only(pred_texts, ref_texts).get("4", 0.0))
 
 
-def _bleu4_collect_shard(_m, valid_dataset, indices: List[int], device: int, tokenizer, batch_size: int):
+def _bleu4_collect_shard(
+    _m,
+    valid_dataset,
+    indices: List[int],
+    device: int,
+    tokenizer,
+    batch_size: int,
+    *,
+    dataloader_num_workers: int,
+    dataloader_prefetch_factor: Optional[int],
+):
     if not indices:
         return [], []
     subset = Subset(valid_dataset, indices)
     n = len(subset)
     bs = max(1, min(int(batch_size), n))
-    _vn = min(2, get_dataloader_num_workers("valid"))
-    _pf = get_dataloader_prefetch_factor(_vn)
+    _vn = max(0, int(dataloader_num_workers))
+    _pf = dataloader_prefetch_factor if _vn > 0 else None
     dl = DataLoader(
         subset,
         batch_size=bs,

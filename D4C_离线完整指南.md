@@ -74,7 +74,11 @@ pip download -r requirements_offline.txt -d offline_wheels
 pip install --no-index --find-links=./offline_wheels -r requirements_offline.txt
 ```
 
-### 3. 运行（在 `code/` 下执行）
+### 3. 运行
+
+**推荐（项目根 `D4C-main/`）**：正式训练请以 **`sh/run_step1_step2.sh`** 与 **`sh/run_step3_optimized.sh` / `sh/run_step4_optimized.sh` / `sh/run_step5_optimized.sh`** 为主入口（checkpoint 与日志落在 `step3_optimized` / `step4_optimized` / `step5_optimized` 约定下）；串联可用 **`sh/run_step3_to_step5_single.sh`** 等。详见下文「五、一键批量运行脚本」。
+
+**历史 / 演示（在 `code/` 下直接执行）**：`code/run_all.sh` 或下列分步命令**不**经过 `sh/` 的路径与环境变量约定，仅作兼容或对照。
 
 ```bash
 cd D4C-main/code
@@ -90,18 +94,21 @@ python preprocess_data.py && python split_data.py && python combine_data.py
 python compute_embeddings.py && python infer_domain_semantics.py
 DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 AdvTrain.py train --auxiliary AM_Electronics --target AM_CDs --epochs 50
 DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 AdvTrain.py eval --auxiliary AM_Electronics --target AM_CDs
-python generate_counterfactual.py
+DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 generate_counterfactual.py
 DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 run-d4c.py --auxiliary AM_Electronics --target AM_CDs --epochs 50
 ```
 
 **常用命令速查：**
 
 ```bash
-# 反事实生成（单卡）
-python generate_counterfactual.py
+# 反事实生成（单卡亦为 DDP：nproc_per_node=1）
+DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 generate_counterfactual.py
 
 # 主训练（须 torchrun / DDP）
-torchrun --standalone --nproc_per_node=1 run-d4c.py --auxiliary <AUX> --target <TGT>
+DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 run-d4c.py --auxiliary <AUX> --target <TGT>
+
+# DDP 链路自检（不评指标；nproc=1 仍是 DDP，不是非分布式模式）
+bash sh/smoke_test_ddp.sh
 ```
 
 ---
@@ -110,7 +117,7 @@ torchrun --standalone --nproc_per_node=1 run-d4c.py --auxiliary <AUX> --target <
 
 - **核心任务**：跨域推荐解释生成（Domain-aware Counterfactual）
 - **框架**：PyTorch + Hugging Face Transformers
-- **主入口**：`code/AdvTrain.py`（域对抗：`torchrun … train` + `eval`）→ `code/generate_counterfactual.py`（反事实数据）→ `code/run-d4c.py`（主训练：`torchrun …`，DDP）
+- **主入口**：`code/AdvTrain.py`（域对抗：`torchrun … train` + `torchrun … eval`）→ `code/generate_counterfactual.py`（反事实：`torchrun …`，含 nproc=1）→ `code/run-d4c.py`（主训练：`torchrun …`，DDP）
 - **数据**：AM_CDs、AM_Electronics、AM_Movies、TripAdvisor、Yelp
 
 ---
@@ -131,7 +138,7 @@ torchrun --standalone --nproc_per_node=1 run-d4c.py --auxiliary <AUX> --target <
 **下载命令（有网环境执行）：**
 
 ```bash
-cd /path/to/D4C-main
+# 以下命令假定当前目录为本仓库根目录（与 D4C_evaluator.py 同级；可先 cd 到克隆目录）
 mkdir -p pretrained_models
 
 # 方式一：huggingface-cli
@@ -153,7 +160,7 @@ AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2').save_pretra
 评估阶段需 METEOR 和 BERTScore，二者均需在有网环境预缓存后拷贝到离线机。
 
 ```bash
-cd /path/to/D4C-main
+# 以下命令假定当前目录为本仓库根目录
 mkdir -p pretrained_models/evaluate_meteor pretrained_models/evaluate_bertscore
 
 # 1. METEOR（evaluate 库的 metric 模块 + NLTK 数据）
@@ -177,7 +184,7 @@ nltk.download('averaged_perceptron_tagger')
 export HF_HOME="$(pwd)/pretrained_models/hf_cache"
 huggingface-cli download microsoft/deberta-xlarge-mnli
 # 2b. 将 pretrained_models/hf_cache 整个目录拷贝到离线机，离线运行时设置：
-#     export HF_HOME=/path/to/D4C-main/pretrained_models/hf_cache
+#     export HF_HOME="$(pwd)/pretrained_models/hf_cache"   # 先在仓库根目录 cd 再执行
 #     export HF_HUB_OFFLINE=1
 #     export TRANSFORMERS_OFFLINE=1
 ```
@@ -185,7 +192,7 @@ huggingface-cli download microsoft/deberta-xlarge-mnli
 **离线运行时环境变量（建议在运行前设置）：**
 
 ```bash
-export HF_HOME=/path/to/D4C-main/pretrained_models/hf_cache   # BERTScore 模型所在目录
+export HF_HOME="$(pwd)/pretrained_models/hf_cache"   # 在仓库根目录执行；BERTScore 模型所在目录
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_EVALUATE_OFFLINE=1                                  # evaluate 库走本地缓存
@@ -282,7 +289,7 @@ python run_preprocess_and_embed.py --embed-batch-size 64
 
 ### Step 3：域对抗预训练（对每个任务运行一次）
 
-Step 3 **仅支持 DDP**：训练与评估均为 `torchrun … AdvTrain.py train|eval …`（eval 在 valid 上分片推理，rank0 聚合指标）。建议使用 `sh/run_step3.sh` 自动依次执行；或手动执行（在 `code/` 目录）：
+Step 3 **仅支持 DDP**：训练与评估均为 `torchrun … AdvTrain.py train|eval …`（eval 在 valid 上分片推理，rank0 聚合指标）。建议使用 `sh/run_step3_optimized.sh` 自动依次执行；或手动执行（在 `code/` 目录）：
 
 ```bash
 # 单卡等价：nproc=1
@@ -302,12 +309,14 @@ DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 AdvTrain.py eval \
 
 ### Step 4：生成反事实数据
 
-```bash
-# 单卡
-python generate_counterfactual.py
+须 **`torchrun` / `python -m torch.distributed.run`**（与 Step 3/5 同一 DDP 主路径；**`nproc_per_node=1` 为单卡 smoke**）：
 
-# 多卡
-python generate_counterfactual.py --gpus 0,1
+```bash
+# 单卡（1 进程 DDP）
+DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 generate_counterfactual.py
+
+# 多卡（与可见 GPU 数一致）
+CUDA_VISIBLE_DEVICES=0,1 DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 generate_counterfactual.py
 ```
 
 ### Step 5：主训练与评估（仅 DDP，须 `torchrun`）
@@ -320,26 +329,29 @@ DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 run-d4c.py \
 # 多卡（与可见 GPU 数一致；全局 batch 须能被进程数整除）
 DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 run-d4c.py \
   --auxiliary AM_Electronics --target AM_CDs --epochs 50 --batch-size 1024
-# 或（在项目根目录，须指定 Step 3 子目录名）：bash sh/run_step5.sh --task 1 --step3-subdir step3_YYYYMMDD_HHMM
-# 或（各任务 Step 3/4 已就绪，自动选每任务最新 step3_*）：bash sh/run_step5_all.sh
+# 或（在项目根目录，须指定 Step 3 子目录名，与 step3_optimized 下目录一致）：bash sh/run_step5_optimized.sh --task 1 --step3-subdir step3_opt_YYYYMMDD_HHMM
+# 或（各任务 Step 3/4 已就绪，自动选每任务最新 step3_opt_*）：bash sh/run_step5_all.sh
 ```
 
 ---
 
 ## 五、一键批量运行脚本
 
-可直接使用仓库中的 `code/run_all.sh`（Step 3 默认 `DDP_NPROC=1`；多卡可 `DDP_NPROC=2 bash run_all.sh`）。
+**主入口**：项目根目录 **`sh/run_step*_optimized.sh`** 及下表串联脚本（与 checkpoint / 日志目录约定一致）。
+
+**`code/run_all.sh`**：**历史 / 演示脚本**（Step 3 默认 `DDP_NPROC=1`；多卡可 `DDP_NPROC=2 bash run_all.sh`），不经过 `sh/` 的路径逻辑；日常训练请优先用下方表格中的 **`sh/run_step*_optimized.sh`**。
 
 **便捷脚本（项目根目录 `sh/`，需先 `cd` 到 `D4C-main` 再执行，或写绝对路径）：**
 
 | 脚本 | 用途 |
 |------|------|
-| `run_step1_step2.sh` | Step 1+2 合并，支持 `--embed-batch-size N`、`--gpus 0,1` |
-| `run_step3.sh` | Step 3（DDP）：train 与 eval 均 `torchrun`；`DDP_NPROC` 或 `--ddp-nproc K`；`--gpus` 仅在你手动单进程跑 eval 时有意义，脚本内已忽略 |
-| `run_step4.sh` | Step 4，`--all` / `--task N`，支持 `--gpus 0,1` |
-| `run_step5.sh` | Step 5（DDP）**仅嵌套**：`--task N` + `--step3-subdir`；`DDP_NPROC` 或 `--ddp-nproc K`（无 `--all`） |
-| `run_step5_all.sh` | Step 5 **批量任务 1–8**：仅调 `run_step5.sh`，每任务自动最新 `step3_*`；`--eval-only` 时再自动最新 `step5_*`；汇总 `log/step5_all_*.log` |
-| `run_step3_to_step5_all.sh` | Step 3-5 全部任务，支持 `--from N` 续跑、`--gpus`（Step4 等）、`--ddp-nproc K`（Step3 train+eval + Step5） |
+| `run_step1_step2.sh` | Step 1+2 合并，支持 `--embed-batch-size N`、`--cuda-device N`（嵌入单卡） |
+| `run_step3_optimized.sh` | Step 3（DDP）：train 与 eval 均 `torchrun`；`DDP_NPROC` 或 `--ddp-nproc K`（`=1` 为单卡 DDP smoke，仍为同一主路径） |
+| `run_step4_optimized.sh` | Step 4，**必填 `--step3-subdir`**（与 `checkpoints/<task>/step3_optimized/<NAME>/` 一致），`--all` / `--task N`；**`torchrun` + `generate_counterfactual.py`** |
+| `run_step5_optimized.sh` | Step 5（DDP）**仅嵌套**：`--task N` + `--step3-subdir`；`DDP_NPROC` 或 `--ddp-nproc K`（无 `--all`） |
+| `run_step5_all.sh` | Step 5 **批量任务 1–8**：仅调 `run_step5_optimized.sh`，每任务自动最新 `step3_opt_*`；`--eval-only` 时再自动最新 `step5_opt_*`；汇总 `log/step5_all_*.log` |
+| `run_step3_to_step5_all.sh` | Step 3-5 全部任务，支持 `--from N` 续跑、`--ddp-nproc K`；多卡请 **`CUDA_VISIBLE_DEVICES`** 与进程数对齐；**已移除 `--gpus`**（传入则报错） |
+| `smoke_test_ddp.sh` | **DDP smoke**：极小 Step3 train/eval + Step4 + Step5，验证不 crash；产物在 **`checkpoints/1/smoke_ddp/`** |
 | `run_step3_to_step5_single.sh` | Step 3-5 单个任务，`--task N`，同上 |
 
 **集群 / 长任务（`tmux-slurm/`）**：Slurm 提交、tmux 与 nohup 包装脚本及说明见 [`tmux-slurm/README.md`](tmux-slurm/README.md)（须在项目根目录执行 `sbatch` / 调用脚本）。
@@ -364,41 +376,40 @@ DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 run-d4c.py \
 
 | 脚本/阶段 | 参数/位置 | 默认值 | 说明 |
 |-----------|-----------|--------|------|
-| `compute_embeddings.py` | `EMBED_BATCH_SIZE` 环境变量、`--gpus` | 256 | 计算 user/item 嵌入时的批次大小，显存不足可减小（如 64、128），多卡可增大（如 1024） |
+| `compute_embeddings.py` | `EMBED_BATCH_SIZE` 环境变量、`--cuda-device` | 256 | **单进程单 GPU** 计算嵌入；显存不足可减小 batch（如 64、128） |
 | `infer_domain_semantics.py` | 无 | 1 | 按 chunk 逐个处理，基本不占显存 |
 | `AdvTrain.py train` / `eval`（`torchrun`） | 全局 `--batch-size` / `config.train_batch_size` | 见 config | DDP 下每 rank 的 DataLoader batch = 全局 / 进程数 |
 | `run-d4c.py`（`torchrun`） | 全局 `--batch-size` / `config.train_batch_size` | 见 config | DDP 下每卡 batch = 全局 / 进程数 |
-| `generate_counterfactual.py` | 硬编码 | 128 | 反事实生成时的 DataLoader 批次大小 |
+| `generate_counterfactual.py` | `--batch-size` / 默认 `train_batch_size` | 见 config | **`torchrun` DDP**：全局 batch，须能被 `WORLD_SIZE` 整除 |
 
 **调整方式：**
 
-- 嵌入阶段：`EMBED_BATCH_SIZE=64 python compute_embeddings.py` 或 `run_preprocess_and_embed.py --embed-batch-size 64`；多卡大 batch：`run_preprocess_and_embed.py --embed-batch-size 1024 --gpus 0,1`
+- 嵌入阶段：`EMBED_BATCH_SIZE=64 python compute_embeddings.py` 或 `run_preprocess_and_embed.py --embed-batch-size 64`；指定 GPU：`python compute_embeddings.py --cuda-device 0`
 - 训练阶段：在对应脚本的 `config` 字典中修改 `"batch_size": 128` 为更小值（如 32、64）
 
 ---
 
 ## 七.1、多 GPU 使用说明
 
-`compute_embeddings.py`、`generate_counterfactual.py` 支持 `--gpus`（DataParallel 等）。`AdvTrain.py eval` 在 **`python` 单进程** 下可用 `--gpus` 做 DataParallel；**`torchrun` 下为 DDP 分片评估**（与 Step 3 训练同一套进程数）。**Step 3 与 Step 5 训练**均为 **DDP**（`torchrun` + 进程数与 `CUDA_VISIBLE_DEVICES` 对齐）；`run-d4c.py` 不可再用 `python` 单进程直接启动。
+**Step 3 / Step 4 / Step 5** 的 GPU 正式链路均为 **`torchrun` + DDP**（含 **`--nproc_per_node=1` 单卡 DDP smoke**，与「非分布式第二套实现」无关）。**`AdvTrain.py eval`** 亦须 **`torchrun`**，不再支持 `python AdvTrain.py eval`。**`compute_embeddings.py`** 为 **单进程单 device**（`--cuda-device`），不设 DataParallel。**`run-d4c.py`** 须 `torchrun` 启动。
 
 ```bash
-# Step 1+2 嵌入阶段多卡（在项目根 D4C-main 下执行；可配合大 batch 如 1024）
-bash sh/run_step1_step2.sh --embed-batch-size 1024 --gpus 0,1
+# Step 1+2：嵌入为单卡（可调 batch 与 --cuda-device）
+bash sh/run_step1_step2.sh --embed-batch-size 1024 --cuda-device 0
 
-# Step 3 / Step 5：在 code/ 下执行；DDP 训练 + DDP 评估（与训练相同 nproc）
+# Step 3 / Step 4 / Step 5：在 code/ 下；进程数与 CUDA_VISIBLE_DEVICES 对齐
 cd code
 DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 AdvTrain.py train \
   --auxiliary AM_Electronics --target AM_CDs --epochs 50
 DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 AdvTrain.py eval \
   --auxiliary AM_Electronics --target AM_CDs
+DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 generate_counterfactual.py
 DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 run-d4c.py \
   --auxiliary AM_Electronics --target AM_CDs --epochs 50 --batch-size 1024
-python generate_counterfactual.py --gpus 0,1
-# 仍位于 code/ 目录
 ```
 
-- 不传 `--gpus` 时，沿用单卡运行（评估与其它步骤）
-- `generate_counterfactual` 的生成阶段为自回归，多卡加速有限，主要适用于训练阶段
+- 单卡自检：`DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 …`
+- 历史脚本 **`code/train.py`**、**`code/naive_counterfactual_train.py`** 为旧实验入口，**不属于**当前统一 DDP pipeline
 
 ---
 
@@ -426,7 +437,7 @@ D4C-main/
 │   ├── TripAdvisor/reviews.pickle
 │   └── Yelp/reviews.pickle
 ├── checkpoints/          # 模型与反事实 CSV（paths_config.CHECKPOINT_DIR）
-├── sh/                   # run_step3.sh、run_step4.sh 等便捷脚本
+├── sh/                   # run_step3_optimized.sh、run_step4_optimized.sh 等便捷脚本
 ├── tmux-slurm/           # Slurm / tmux / nohup 辅助脚本
 ├── code/
 │   ├── run_all.sh

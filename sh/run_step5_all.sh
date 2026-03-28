@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Step 5 批量：对任务 1–8 依次调用 run_step5.sh（仅嵌套 checkpoint；每任务自动选最新 step3_*；--eval-only 时再选最新 step5_*）
+# -----------------------------------------------------------------------------
+# 兼容入口（推荐后续收敛至）：bash scripts/train_ddp.sh — 见 docs/D4C_RUNTIME_SPEC.md
+# -----------------------------------------------------------------------------
+# Step 5 批量：对任务 1–8 依次调用 run_step5_optimized.sh（仅嵌套 checkpoint；每任务自动选最新 step3_opt_*；--eval-only 时再选最新 step5_opt_*）
 # 用法: bash run_step5_all.sh [--from N] [--skip N,M,...] [--eval-only|--train-only] [--batch-size N] [--epochs N] [--num-proc N] [--ddp-nproc K] [--daemon|--bg]
 #
-# 前置：各任务的 Step 3 + Step 4 已完成（checkpoints/<task>/step3/step3_*/ 含 model.pth 与 factuals_counterfactuals.csv）
-# 日志：每任务主日志在 log/<task>/step5/runs/…（见 run_step5.sh）；本脚本可选 tee 到 log/step5_all_*.log
+# 前置：各任务的 Step 3 + Step 4 已完成（checkpoints/<task>/step3_optimized/step3_opt_*/ 含 model.pth 与 factuals_counterfactuals.csv）
+# 日志：每任务主日志在 log/<task>/step5_optimized/runs/…（见 run_step5_optimized.sh）；本脚本可选 tee 到 log/step5_all_*.log
 #
 # 示例:
 #   DDP_NPROC=1 bash sh/run_step5_all.sh
@@ -23,20 +26,20 @@ SCRIPT_PATH="$SH_DIR/$(basename "${BASH_SOURCE[0]}")"
 
 d4c_latest_step3_subdir() {
     local tid=$1
-    local base="$D4C_ROOT/checkpoints/$tid/step3"
+    local base="$D4C_ROOT/checkpoints/$tid/step3_optimized"
     [ -d "$base" ] || return 1
     local latest
-    latest=$(ls -1td "$base"/step3_* 2>/dev/null | head -1)
+    latest=$(ls -1td "$base"/step3_opt_* 2>/dev/null | head -1)
     [ -n "$latest" ] || return 1
     basename "$latest"
 }
 d4c_latest_step5_inner() {
     local tid=$1
     local s3=$2
-    local sd="$D4C_ROOT/checkpoints/$tid/step3/$s3/step5"
+    local sd="$D4C_ROOT/checkpoints/$tid/step3_optimized/$s3/step5"
     [ -d "$sd" ] || return 1
     local latest
-    latest=$(ls -1td "$sd"/step5_* 2>/dev/null | head -1)
+    latest=$(ls -1td "$sd"/step5_opt_* 2>/dev/null | head -1)
     [ -n "$latest" ] || return 1
     basename "$latest"
 }
@@ -70,7 +73,16 @@ while [ $# -gt 0 ]; do
         --num-proc) NUM_PROC="--num-proc $2"; shift 2 ;;
         --ddp-nproc) DDP_EXTRA="--ddp-nproc $2"; shift 2 ;;
         --daemon|--bg) DAEMON=1; shift ;;
-        *) shift ;;
+        --gpus|--gpus=*)
+            echo "错误: --gpus has been removed. 请使用 CUDA_VISIBLE_DEVICES 与 DDP_NPROC / --ddp-nproc（torchrun --nproc_per_node）。" >&2
+            echo "单卡 DDP smoke: DDP_NPROC=1 bash sh/run_step5_optimized.sh --task 1 --step3-subdir <NAME> …" >&2
+            exit 2
+            ;;
+        *)
+            echo "错误: 未知参数: $1" >&2
+            echo "提示: 仅支持 --from / --skip / --eval-only / --train-only / --batch-size / --epochs / --num-proc / --ddp-nproc / --daemon|--bg。" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -107,7 +119,7 @@ if [ -z "${INTERNAL_NOHUP:-}" ]; then
 fi
 [ -n "$SKIP_LIST" ] && echo "跳过任务: $SKIP_LIST"
 echo "启动 Step 5 全部任务 (Task $TASK_LIST)，终端汇总: $LOGFILE"
-echo "（每任务 Python 日志: log/<task>/step5/runs/…/train.log）"
+echo "（每任务 Python 日志: log/<task>/step5_optimized/runs/…/train.log）"
 
 STEP5_EVAL=""
 [ -n "$EVAL_ONLY" ] && STEP5_EVAL="--eval-only"
@@ -124,18 +136,18 @@ for i in $TASK_LIST; do
         echo "========== Task $i: Step 5 =========="
     fi
     STEP3_SUB="$(d4c_latest_step3_subdir "$i")" || {
-        echo "错误: Task $i 未找到 checkpoints/$i/step3/step3_*（须先完成 Step 3/4）" | tee -a "$LOGFILE"
+        echo "错误: Task $i 未找到 checkpoints/$i/step3_optimized/step3_opt_*（须先完成 Step 3/4）" | tee -a "$LOGFILE"
         exit 1
     }
     NEST_ARG=()
     if [ -n "$EVAL_ONLY" ]; then
         _inn="$(d4c_latest_step5_inner "$i" "$STEP3_SUB")" || {
-            echo "错误: Task $i 未找到 …/step3/$STEP3_SUB/step5/step5_*（--eval-only 须已有 Step 5 训练目录）" | tee -a "$LOGFILE"
+            echo "错误: Task $i 未找到 …/step3_optimized/$STEP3_SUB/step5/step5_opt_*（--eval-only 须已有 Step 5 训练目录）" | tee -a "$LOGFILE"
             exit 1
         }
         NEST_ARG=(--nested-subdir "$_inn")
     fi
-    if ! bash "$SH_DIR/run_step5.sh" --task "$i" --step3-subdir "$STEP3_SUB" "${NEST_ARG[@]}" $STEP5_EVAL $STEP5_TRAIN $BATCH_SIZE $EPOCHS $NUM_PROC $DDP_EXTRA 2>&1 | tee -a "$LOGFILE"; then
+    if ! bash "$SH_DIR/run_step5_optimized.sh" --task "$i" --step3-subdir "$STEP3_SUB" "${NEST_ARG[@]}" $STEP5_EVAL $STEP5_TRAIN $BATCH_SIZE $EPOCHS $NUM_PROC $DDP_EXTRA 2>&1 | tee -a "$LOGFILE"; then
         echo "Task $i Step 5 失败，可续跑: $0 --from $i $BATCH_SIZE $EPOCHS $NUM_PROC $DDP_EXTRA"
         exit 1
     fi

@@ -1,3 +1,11 @@
+"""
+DEPRECATED — not part of the supported DDP pipeline.
+
+Kept only for historical / experimental reference. No guarantee of compatibility
+with the current torchrun-based main scripts. Do not rely on it for reproduction.
+
+反事实与主训练请以 generate_counterfactual.py、run-d4c.py（均须 torchrun）为准。
+"""
 import os
 import sys
 os.environ.setdefault("HF_HUB_OFFLINE", "1")

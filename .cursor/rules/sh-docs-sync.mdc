@@ -8,9 +8,11 @@ alwaysApply: false
 
 凡修改 **`sh/` 下任意 `*.sh`** 或 **`code/paths_config.py`**（参数、默认、日志/checkpoint 规则、`D4C_ROOT` 相关行为等），**在同一提交内**须同步更新以下三份 Markdown，使叙述与源码一致：
 
-1. `sh/用法速查 copy 2.md` — 速查表、示例命令、`checkpoints/` / `log/` 与各脚本摘要
-2. `sh/脚本参数说明 copy 2.md` — 必填/可选参数、默认值、互斥项、与 Python/torchrun 的衔接
+1. `sh/用法速查 copy 3.md` — 速查表、示例命令、`checkpoints/` / `log/` 与各脚本摘要（**当前仓库唯一维护的「速查」规范名**）
+2. `sh/脚本参数说明 copy 3.md` — 必填/可选参数、默认值、互斥项、与 Python/torchrun 的衔接（**当前仓库唯一维护的「参数说明」规范名**）
 3. `路径规范备忘 copy.md` — 路径总览、与 `paths_config` / `sh/` 对齐、排障要点
+
+说明：历史上曾引用 `copy 2.md`，仓库内已无该文件；钩子与规则已对齐为 **copy 3**，避免双套文档。
 
 **原则**：以脚本与 `paths_config.py` 为准；文档之间若有不一致，以源码为准并修正文档。
 

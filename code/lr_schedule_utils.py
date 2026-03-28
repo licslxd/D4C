@@ -13,12 +13,14 @@ def resolve_warmup_steps(
     explicit_steps: Optional[int],
     explicit_ratio: Optional[float],
     warmup_epochs_fallback: float,
-    train_mode: str,
 ) -> Tuple[int, float]:
     """
     返回 (warmup_steps, warmup_ratio)，其中 warmup_ratio = warmup_steps / total_steps（用于日志）。
 
-    优先级：显式 steps > 显式 ratio > D4C_WARMUP_EPOCHS 换算 > optimized 默认 ratio 0.05 > 否则约 1 epoch。
+    total_steps、warmup_steps 均按 **optimizer step**（梯度累积后的全局优化步）口径，与训练循环一致。
+
+    优先级：显式 steps > 显式 ratio > warmup_epochs_fallback（按每 epoch 的 optimizer 步数换算）>
+    默认 warmup 比例 0.05 × total_steps。
     """
     ts = max(1, int(total_steps))
     ne = max(1, int(n_steps_per_epoch))
@@ -32,12 +34,9 @@ def resolve_warmup_steps(
     if warmup_epochs_fallback > 0:
         ws = max(1, min(int(warmup_epochs_fallback * ne), ts))
         return ws, ws / float(ts)
-    if train_mode == "optimized":
-        wr = 0.05
-        ws = max(1, min(int(wr * ts), ts))
-        return ws, wr
-    ws = max(1, min(ne, ts))
-    return ws, ws / float(ts)
+    wr = 0.05
+    ws = max(1, min(int(wr * ts), ts))
+    return ws, wr
 
 
 def warmup_cosine_multiplier_lambda(

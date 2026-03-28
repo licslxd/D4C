@@ -1,0 +1,65 @@
+# 与 TRAINING_PRESETS["step5"] 一致（文件名 = 预设名）；与 step3 超参相同，供 Step 5 默认 D4C_TRAIN_PRESET
+1:
+  train_batch_size: 1024
+  epochs: 30
+  full_eval_every_epochs: 2
+  min_lr_ratio: 0.1
+  adv: 0.005
+  lr: 5.0e-4
+  coef: 1
+2:
+  train_batch_size: 1024
+  epochs: 30
+  full_eval_every_epochs: 2
+  min_lr_ratio: 0.1
+  adv: 0.005
+  lr: 1.0e-3
+  coef: 0.1
+3:
+  train_batch_size: 1024
+  epochs: 30
+  full_eval_every_epochs: 2
+  min_lr_ratio: 0.1
+  adv: 0.005
+  lr: 5.0e-4
+  coef: 0.5
+4:
+  train_batch_size: 1024
+  epochs: 30
+  full_eval_every_epochs: 2
+  min_lr_ratio: 0.1
+  adv: 0.005
+  lr: 1.0e-3
+  coef: 0.5
+5:
+  train_batch_size: 1024
+  epochs: 30
+  full_eval_every_epochs: 2
+  min_lr_ratio: 0.1
+  adv: 0.005
+  lr: 1.0e-3
+  coef: 0.5
+6:
+  train_batch_size: 1024
+  epochs: 30
+  full_eval_every_epochs: 2
+  min_lr_ratio: 0.1
+  adv: 0.005
+  lr: 1.0e-3
+  coef: 0.5
+7:
+  train_batch_size: 1024
+  epochs: 30
+  full_eval_every_epochs: 2
+  min_lr_ratio: 0.1
+  adv: 0.005
+  lr: 1.0e-4
+  coef: 0.5
+8:
+  train_batch_size: 1024
+  epochs: 30
+  full_eval_every_epochs: 2
+  min_lr_ratio: 0.1
+  adv: 0.005
+  lr: 5.0e-4
+  coef: 1

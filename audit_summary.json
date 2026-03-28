@@ -1,0 +1,85 @@
+{
+  "project_overview": {
+    "purpose": "跨域推荐与解释生成（D4C）：Step1-2 嵌入与预处理、Step3 域对抗预训练（AdvTrain）、Step4 反事实生成（generate_counterfactual）、Step5 主训练（run-d4c），统一 torchrun + NCCL DDP。",
+    "stack": "PyTorch DDP、HuggingFace datasets/transformers、T5 tokenizer、自定义 Transformer（非 HF 预训练权重直接微调）、pandas/numpy。",
+    "main_entries": ["code/AdvTrain.py", "code/run-d4c.py", "code/generate_counterfactual.py", "sh/run_step3_optimized.sh", "sh/run_step4_optimized.sh", "sh/run_step5_optimized.sh"],
+    "top_modules": ["code/config.py (FinalTrainingConfig/build_resolved_training_config)", "code/AdvTrain.py + code/run-d4c.py (训练循环与数据)", "code/paths_config.py", "code/perf_monitor.py", "code/train_logging.py"]
+  },
+  "top_risks": [
+    {
+      "id": "R1",
+      "title": "run-d4c 验证集 loss 仅用 rank0 分片且 broadcast，非零 rank 白跑 valid 且指标语义为 rank0 子集",
+      "severity": "high",
+      "location": "code/run-d4c.py validModel + trainModel_ddp broadcast"
+    },
+    {
+      "id": "R2",
+      "title": "多卡启动时每个 rank 重复执行 datasets.map Tokenize，CPU/内存与启动时间成倍",
+      "severity": "high",
+      "location": "code/AdvTrain.py _load_advtrain_artefacts, code/run-d4c.py build_d4c_ddp_artefacts, code/generate_counterfactual.py _run_one_task"
+    },
+    {
+      "id": "R3",
+      "title": "run_preprocess_and_embed.py 使用 subprocess shell=True 拼接命令",
+      "severity": "medium",
+      "location": "code/run_preprocess_and_embed.py"
+    }
+  ],
+  "performance_bottlenecks": [
+    {
+      "category": "CPU/sync",
+      "title": "训练内层循环每微批 loss.item()",
+      "priority": "P0",
+      "location": "code/AdvTrain.py trainModel_ddp ~931, code/run-d4c.py trainModel_ddp ~516"
+    },
+    {
+      "category": "data",
+      "title": "无离线 tokenized 缓存，每次进程启动全量 map",
+      "priority": "P0",
+      "location": "datasets.map in AdvTrain/run-d4c/generate_counterfactual"
+    },
+    {
+      "category": "GPU",
+      "title": "未使用 AMP/bf16，全精度 Adam + 大词表 CE",
+      "priority": "P1",
+      "location": "trainModel_ddp optim.Adam, 无 autocast"
+    },
+    {
+      "category": "distributed",
+      "title": "DDP find_unused_parameters 默认 True（run-d4c FinalTrainingConfig）",
+      "priority": "P1",
+      "location": "code/run-d4c.py DDP 包装"
+    },
+    {
+      "category": "eval",
+      "title": "每 epoch barrier + BLEU/quick eval，rank0 tqdm 其它 rank 空转等待",
+      "priority": "P1",
+      "location": "code/run-d4c.py trainModel_ddp dist.barrier, bleu 路径"
+    }
+  ],
+  "code_quality_issues": [
+    "run-d4c.py 与 AdvTrain.py 大量重复 Processor/Model/train 逻辑，维护成本高",
+    "魔法数 32128（词表）、max_length=25 散落多处",
+    "generate_counterfactual.py `from AdvTrain import *` 耦合过重",
+    "requirements_offline.txt 未锁 PyTorch/CUDA 小版本，可复现性弱"
+  ],
+  "quick_wins": [
+    "将每 step 的 loss.item() 改为 GPU 张量累加，epoch 末或每 N step 再同步一次",
+    "export TOKENIZERS_PARALLELISM=false；为 DataLoader 所在进程设置 OMP_NUM_THREADS（如每 worker 1-2）",
+    "仅 rank0 执行 datasets.map + save_to_disk，其它 rank load_from_disk，或共享 NFS 上单一 Arrow 缓存",
+    "确认 D4C_DDP_FAST=1（默认）以启用 TF32+cudnn.benchmark；在支持的 GPU 上尝试 bf16 autocast",
+    "run-d4c：valid 阶段改为 all_reduce 聚合 loss_sum/n_batches（与 AdvTrain validModel_sum_batches 一致），或仅 rank0 跑 valid_dataloader"
+  ],
+  "mid_term_refactors": [
+    "抽取共享 data pipeline 模块：tokenize 缓存键（数据哈希+tokenizer 版本）、统一 Processor",
+    "评估与 checkpoint 策略配置化：降低 full BLEU 频率或异步评估",
+    "考虑 torch.compile（需验证自定义 Transformer 兼容性）或 fused AdamW",
+    "长度分桶/按长度 batch（当前 max_length 固定 padding，浪费相对较小但仍可优化）"
+  ],
+  "questions_for_human": [
+    "valid loss 在 run-d4c 中是否故意设计为仅 rank0 子集平均（与论文脚本一致）？若需全局 valid loss，需改聚合方式。",
+    "集群共享存储上 Arrow 缓存文件锁与并发写入策略。",
+    "目标 GPU 架构（Ampere+）是否允许默认 bf16 而不损实验可比性。",
+    "Step4 日志中 step_time~17s、GPU 7% 是否主要为 autoregressive generate 步数与 batch 过小导致，需业务确认是否接受更大 batch 或缓存 KV。"
+  ]
+}
