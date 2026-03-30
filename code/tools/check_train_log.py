@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""对 train.log 做轻量自检（shell 行混入、Epoch 序号连续性）。用法（在 code 目录）:
-  python check_train_log.py /path/to/train.log
-  python check_train_log.py ../log/1/step3_optimized/runs/xxx/train.log --json
-  python check_train_log.py train.log --strict   # 有问题时退出码 2
+"""对 train.log 做轻量自检（shell 行混入、Epoch 序号连续性）。用法（在项目根）:
+  python code/tools/check_train_log.py /path/to/train.log
+  python code/tools/check_train_log.py log/1/step3_optimized/runs/xxx/train.log --json
+  python code/tools/check_train_log.py train.log --strict   # 有问题时退出码 2
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
-from train_logging import audit_train_log_file
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+_CODE_DIR = os.path.dirname(_TOOLS_DIR)
+if _CODE_DIR not in sys.path:
+    sys.path.insert(0, _CODE_DIR)
+
+from train_logging import audit_train_log_file  # noqa: E402
 
 
 def main() -> int:

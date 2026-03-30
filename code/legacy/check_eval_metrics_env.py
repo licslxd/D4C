@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """检查 METEOR / evaluate 离线缓存是否就绪，避免 FINAL RESULTS 中 METEOR=0。"""
+# LEGACY / NOT PART OF THE NEW MAINLINE
 import os
 import sys
 
-_REPO = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_REPO)
+_LEGACY_DIR = os.path.dirname(os.path.abspath(__file__))
+_CODE_DIR = os.path.dirname(_LEGACY_DIR)
+_ROOT = os.path.dirname(_CODE_DIR)
 _NLTK = os.path.join(_ROOT, "pretrained_models", "nltk_data")
 
 

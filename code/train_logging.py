@@ -391,6 +391,45 @@ def _fmt_duration_sec(t: float) -> str:
     return f"{t:.1f}s"
 
 
+def format_epoch_summary_lines(
+    *,
+    epoch: int,
+    train_loss_total_epoch: float,
+    train_loss_r_epoch: float,
+    train_loss_c_epoch: float,
+    train_loss_e_epoch: float,
+    valid_loss_total_epoch: float,
+    valid_loss_r_epoch: float,
+    valid_loss_c_epoch: float,
+    valid_loss_e_epoch: float,
+    lr: float,
+    quick_bleu4: Optional[float] = None,
+    full_bleu4: Optional[float] = None,
+    meteor: Optional[float] = None,
+) -> str:
+    """紧凑 [Epoch Summary] 块（明文，便于 grep）。"""
+    lines = [
+        "[Epoch Summary]",
+        f"epoch={epoch}",
+        f"train_loss_total_epoch={train_loss_total_epoch:.6g}",
+        f"train_loss_r_epoch={train_loss_r_epoch:.6g}",
+        f"train_loss_c_epoch={train_loss_c_epoch:.6g}",
+        f"train_loss_e_epoch={train_loss_e_epoch:.6g}",
+        f"valid_loss_total_epoch={valid_loss_total_epoch:.6g}",
+        f"valid_loss_r_epoch={valid_loss_r_epoch:.6g}",
+        f"valid_loss_c_epoch={valid_loss_c_epoch:.6g}",
+        f"valid_loss_e_epoch={valid_loss_e_epoch:.6g}",
+        f"lr={lr:.6g}",
+    ]
+    if quick_bleu4 is not None:
+        lines.append(f"quick_bleu4={quick_bleu4:.6g}")
+    if full_bleu4 is not None:
+        lines.append(f"full_bleu4={full_bleu4:.6g}")
+    if meteor is not None:
+        lines.append(f"meteor={meteor:.6g}")
+    return "\n".join(lines) + "\n\n"
+
+
 def format_epoch_training_block(
     *,
     time_str: str,
@@ -444,13 +483,124 @@ def log_epoch_training_block(logger: Optional[logging.Logger], text: str) -> Non
     _write_plain_log_block(logger, text, route=ROUTE_SUMMARY)
 
 
+def log_epoch_summary_compact(logger: Optional[logging.Logger], text: str) -> None:
+    """[Epoch Summary] 等紧凑块，与 epoch 训练块相同路由（摘要侧）。"""
+    _write_plain_log_block(logger, text, route=ROUTE_SUMMARY)
+
+
+def format_collapse_summary_lines(collapse: Dict[str, Any]) -> List[str]:
+    """[Collapse Summary] 明文块。"""
+    top10 = collapse.get("top10_pred_texts_with_count") or []
+    parts = []
+    for i, item in enumerate(top10, 1):
+        t = (item.get("text") or "").replace("\n", " ")[:120]
+        parts.append(f"  #{i} count={item.get('count')} text={t!r}")
+    warn = collapse.get("collapse_warnings") or []
+    wline = f"collapse_warnings={warn}" if warn else "collapse_warnings=[]"
+    if warn:
+        wline = "[Collapse warning] " + wline
+    lines = [
+        "[Collapse Summary]",
+        f"top1_pred={(collapse.get('top1_pred_text') or '')[:160]!r}",
+        f"top1_count={collapse.get('top1_pred_count')}",
+        f"top1_ratio={collapse.get('top1_pred_ratio')}",
+        f"unique_count={collapse.get('pred_unique_count')}",
+        f"unique_ratio={collapse.get('pred_unique_ratio')}",
+        f"mean_pred_len_tokens={collapse.get('mean_pred_len_tokens')}",
+        f"mean_ref_len_tokens={collapse.get('mean_ref_len_tokens')}",
+        "top10=",
+        *parts,
+        wline,
+    ]
+    return lines
+
+
+def format_eval_summary_lines(
+    *,
+    decode_cfg: Dict[str, Any],
+    final: Dict[str, Any],
+    collapse: Optional[Dict[str, Any]] = None,
+    eval_run_tag: str = "",
+) -> List[str]:
+    """[Eval Summary] 紧凑一行式关键指标（decode + 主分数 + 塌缩摘要）。
+
+    dist1_evaluate_text/dist2_evaluate_text 与 FINAL RESULTS 中 paper-compatible DIST 一致；
+    ext_* 为 extended_text_metrics_bundle，诊断用，非论文主表 DIST。
+    """
+    ex = final["explanation"]
+    bl = ex["bleu"]
+    lines = [
+        "[Eval Summary]",
+        f"eval_run_tag={eval_run_tag}" if eval_run_tag else "eval_run_tag=",
+        f"decode={decode_cfg.get('decode_strategy')}",
+        f"temp={decode_cfg.get('generate_temperature')}",
+        f"top_p={decode_cfg.get('generate_top_p')}",
+        f"penalty={decode_cfg.get('repetition_penalty')}",
+        f"decode_seed={decode_cfg.get('decode_seed')}",
+        f"label_smoothing={decode_cfg.get('label_smoothing')}",
+        f"max_explanation_length={decode_cfg.get('max_explanation_length')}",
+        f"mae={final['recommendation']['mae']}",
+        f"rmse={final['recommendation']['rmse']}",
+        f"bleu4={bl['4']}",
+        f"meteor={ex['meteor']}",
+        f"rouge_l={ex['rouge']['l']}",
+    ]
+    ext = final.get("text_metrics_corpus_and_sentence") or {}
+    corp = ext.get("corpus_level") or {}
+    sent = ext.get("sentence_level_mean") or {}
+    di = ex.get("dist") or {}
+    lines.extend(
+        [
+            f"dist1_evaluate_text={di.get('1')}",
+            f"dist2_evaluate_text={di.get('2')}",
+            f"ext_corpus_distinct_1_pct={corp.get('distinct_1_pct')}",
+            f"ext_corpus_distinct_2_pct={corp.get('distinct_2_pct')}",
+            f"ext_sentence_distinct_1_pct={sent.get('distinct_1_pct')}",
+            f"ext_sentence_distinct_2_pct={sent.get('distinct_2_pct')}",
+            f"ext_unigram_repetition={sent.get('unigram_repetition_ratio')}",
+            f"ext_trigram_repetition={sent.get('trigram_repetition_ratio')}",
+            f"ext_mean_pred_len_words={corp.get('mean_pred_len_words')}",
+            f"ext_mean_ref_len_words={corp.get('mean_ref_len_words')}",
+        ]
+    )
+    if collapse:
+        lines.append(f"top1_ratio={collapse.get('top1_pred_ratio')}")
+        lines.append(f"unique_ratio={collapse.get('pred_unique_ratio')}")
+    return lines
+
+
+def format_eval_metrics_ext_lines(final: Dict[str, Any]) -> List[str]:
+    """[Eval metrics ext]：extended_text_metrics_bundle，仅供诊断；非论文主表 DIST-1/DIST-2。"""
+    ext = final.get("text_metrics_corpus_and_sentence") or {}
+    corp = ext.get("corpus_level") or {}
+    sent = ext.get("sentence_level_mean") or {}
+    tab = "\t"
+    return [
+        "[Eval metrics ext] (extended_text_metrics_bundle; 诊断：塌缩/重复/句内句间多样性；"
+        "勿与主表 DIST-1/DIST-2 混同，不参与与论文主表的横向对比)",
+        f"{tab}ext_corpus_distinct_1_pct={corp.get('distinct_1_pct')}",
+        f"{tab}ext_corpus_distinct_2_pct={corp.get('distinct_2_pct')}",
+        f"{tab}ext_sentence_distinct_1_pct={sent.get('distinct_1_pct')}",
+        f"{tab}ext_sentence_distinct_2_pct={sent.get('distinct_2_pct')}",
+        f"{tab}ext_unigram_repetition={sent.get('unigram_repetition_ratio')}",
+        f"{tab}ext_trigram_repetition={sent.get('trigram_repetition_ratio')}",
+        f"{tab}ext_mean_pred_len_words={corp.get('mean_pred_len_words')}",
+        f"{tab}ext_mean_ref_len_words={corp.get('mean_ref_len_words')}",
+    ]
+
+
 def format_final_results_lines(
     final: Dict[str, Any],
     *,
     task_description: Optional[str] = None,
     start_time: Optional[str] = None,
+    decode_cfg: Optional[Dict[str, Any]] = None,
+    collapse_stats: Optional[Dict[str, Any]] = None,
+    eval_run_tag: str = "",
 ) -> List[str]:
     """构建 FINAL RESULTS 文本行（无 log 前缀；指标行用制表符缩进）。
+
+    Explanation 块中 DIST-1/DIST-2 为 evaluate_text 语料级 distinct（论文可比）；其后的 [Eval metrics ext] 为诊断扩展，非主表 DIST。
 
     task_description: 可选，在评估结果块最上方增加一行「任务说明：…」（位于 FINAL RESULTS 分隔线之上）。
     start_time: 可选，eval 开始时间字符串；未传则用当前时间。
@@ -473,12 +623,19 @@ def format_final_results_lines(
             "[Explanation]",
             f"{tab}ROUGE: {final['explanation']['rouge']['1']}, {final['explanation']['rouge']['2']}, {final['explanation']['rouge']['l']} ",
             f"{tab}BLEU: {final['explanation']['bleu']['1']}, {final['explanation']['bleu']['2']}, {final['explanation']['bleu']['3']}, {final['explanation']['bleu']['4']} ",
-            f"{tab}DIST: {final['explanation']['dist']['1']}, {final['explanation']['dist']['2']},",
+            f"{tab}DIST-1/DIST-2 (evaluate_text, paper-compatible): {final['explanation']['dist']['1']}, {final['explanation']['dist']['2']}",
             f"{tab}METEOR: {final['explanation']['meteor']} ",
         ]
     )
     if "bert" in final.get("explanation", {}):
         lines.append(f"{tab}BERT: {final['explanation']['bert']} ")
+    lines.extend(format_eval_metrics_ext_lines(final))
+    if decode_cfg is not None:
+        lines.append("")
+        lines.extend(format_eval_summary_lines(decode_cfg=decode_cfg, final=final, collapse=collapse_stats, eval_run_tag=eval_run_tag))
+    if collapse_stats:
+        lines.append("")
+        lines.extend(format_collapse_summary_lines(collapse_stats))
     return lines
 
 
@@ -535,6 +692,17 @@ def finalize_run_log(logger: Optional[logging.Logger], extra: Optional[str] = No
             logger.info("%s", extra, extra=log_route_extra(logger, ROUTE_BOTH))
     elif extra:
         print(extra, flush=True)
+
+
+def flush_d4c_file_handlers(logger: Optional[logging.Logger]) -> None:
+    """将 d4c logger 各 Handler 缓冲刷盘（读取日志尾部前调用，避免 tail 缺最新行）。"""
+    if logger is None:
+        return
+    for h in logger.handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
 
 
 # 误写入 train.log 的常见 shell 行（历史 bug 或手工重定向）
@@ -622,6 +790,14 @@ _EVAL_SUMMARY_CSV_FIELDS: Tuple[str, ...] = (
     "log_file",
     "save_file",
     "task_description",
+    "eval_export_tag",
+    "decode_strategy",
+    "generate_temperature",
+    "generate_top_p",
+    "repetition_penalty",
+    "decode_seed",
+    "label_smoothing",
+    "max_explanation_length",
     "mae",
     "rmse",
     "rouge_1",
@@ -634,6 +810,18 @@ _EVAL_SUMMARY_CSV_FIELDS: Tuple[str, ...] = (
     "dist_1",
     "dist_2",
     "meteor",
+    "ext_corpus_distinct_1",
+    "ext_corpus_distinct_2",
+    "ext_sentence_distinct_1",
+    "ext_sentence_distinct_2",
+    "ext_unigram_repetition",
+    "ext_trigram_repetition",
+    "ext_mean_pred_len_words",
+    "ext_mean_ref_len_words",
+    "collapse_unique_count",
+    "collapse_unique_ratio",
+    "collapse_top1_ratio",
+    "collapse_mean_pred_len_tokens",
     "eval_elapsed_s",
 )
 
@@ -664,8 +852,11 @@ def _global_eval_summary_dir() -> str:
     return os.path.join(_root, "log", _EVAL_SUMMARY_SUBDIR)
 
 
-def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, float]:
-    """将 FINAL RESULTS 指标摊平为可写入 CSV/JSON 的标量。"""
+def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, Any]:
+    """将 FINAL RESULTS + ext + collapse 摊平为可写入 CSV/JSON 的标量。
+
+    dist_1/dist_2 来自 evaluate_text（论文主表口径）；ext_* 列为诊断扩展指标，勿与 dist_* 混读。
+    """
     r = final["recommendation"]
     e = final["explanation"]
     rg = e["rouge"]
@@ -677,7 +868,7 @@ def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, float]
             return float(x.item())
         return float(x)
 
-    d = {
+    d: Dict[str, Any] = {
         "mae": _f(r["mae"]),
         "rmse": _f(r["rmse"]),
         "rouge_1": _f(rg["1"]),
@@ -693,6 +884,30 @@ def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, float]
     }
     if "bert" in e:
         d["bert"] = _f(e["bert"])
+
+    ext = final.get("text_metrics_corpus_and_sentence") or {}
+    corp = ext.get("corpus_level") or {}
+    sent = ext.get("sentence_level_mean") or {}
+    d["ext_corpus_distinct_1"] = corp.get("distinct_1_pct", "")
+    d["ext_corpus_distinct_2"] = corp.get("distinct_2_pct", "")
+    d["ext_sentence_distinct_1"] = sent.get("distinct_1_pct", "")
+    d["ext_sentence_distinct_2"] = sent.get("distinct_2_pct", "")
+    d["ext_unigram_repetition"] = sent.get("unigram_repetition_ratio", "")
+    d["ext_trigram_repetition"] = sent.get("trigram_repetition_ratio", "")
+    d["ext_mean_pred_len_words"] = corp.get("mean_pred_len_words", "")
+    d["ext_mean_ref_len_words"] = corp.get("mean_ref_len_words", "")
+
+    cs = final.get("collapse_stats") or {}
+    if cs:
+        d["collapse_unique_count"] = cs.get("pred_unique_count", "")
+        d["collapse_unique_ratio"] = cs.get("pred_unique_ratio", "")
+        d["collapse_top1_ratio"] = cs.get("top1_pred_ratio", "")
+        d["collapse_mean_pred_len_tokens"] = cs.get("mean_pred_len_tokens", "")
+    else:
+        d["collapse_unique_count"] = ""
+        d["collapse_unique_ratio"] = ""
+        d["collapse_top1_ratio"] = ""
+        d["collapse_mean_pred_len_tokens"] = ""
     return d
 
 
@@ -723,6 +938,20 @@ def _append_csv_row(path: str, row: Dict[str, Any]) -> None:
         w.writerow({k: row.get(k, "") for k in _EVAL_SUMMARY_CSV_FIELDS})
 
 
+def append_train_epoch_metrics_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """与 train.log 同目录追加每 epoch 一行 JSON（分项 loss 等）。"""
+    if not log_file:
+        return
+    try:
+        d = os.path.dirname(os.path.abspath(os.path.expanduser(log_file)))
+        if not d:
+            return
+        path = os.path.join(d, "train_epoch_metrics.jsonl")
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
 def append_eval_run_summaries(
     final: Dict[str, Any],
     *,
@@ -736,6 +965,8 @@ def append_eval_run_summaries(
     task_description: Optional[str] = None,
     start_time: Optional[str] = None,
     eval_elapsed: Optional[float] = None,
+    decode_cfg: Optional[Dict[str, Any]] = None,
+    eval_export_tag: str = "",
 ) -> None:
     """将一次 eval 的指标追加到每任务目录与全局目录下的 .txt / .jsonl / .csv（共 6 个文件）。
 
@@ -754,6 +985,7 @@ def append_eval_run_summaries(
 
     ts = start_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     desc_one_line = (task_description or "").replace("\n", " ").strip()
+    dc = decode_cfg or {}
     row: Dict[str, Any] = {
         "ts": ts,
         "run_id": run_id or "",
@@ -764,17 +996,33 @@ def append_eval_run_summaries(
         "log_file": os.path.abspath(os.path.expanduser(log_file)) if log_file else "",
         "save_file": os.path.abspath(os.path.expanduser(save_file)) if save_file else "",
         "task_description": desc_one_line,
+        "eval_export_tag": eval_export_tag or "",
+        "decode_strategy": dc.get("decode_strategy", ""),
+        "generate_temperature": dc.get("generate_temperature", ""),
+        "generate_top_p": dc.get("generate_top_p", ""),
+        "repetition_penalty": dc.get("repetition_penalty", ""),
+        "decode_seed": dc.get("decode_seed", ""),
+        "label_smoothing": dc.get("label_smoothing", ""),
+        "max_explanation_length": dc.get("max_explanation_length", ""),
         **metrics,
         "eval_elapsed_s": round(eval_elapsed, 1) if eval_elapsed is not None else "",
     }
 
-    lines_block = format_final_results_lines(final, task_description=task_description, start_time=start_time)
+    lines_block = format_final_results_lines(
+        final,
+        task_description=task_description,
+        start_time=start_time,
+        decode_cfg=decode_cfg,
+        collapse_stats=final.get("collapse_stats"),
+        eval_run_tag=eval_export_tag,
+    )
     if eval_elapsed is not None:
         _m, _s = divmod(int(eval_elapsed), 60)
         lines_block.append(f"Eval elapsed: {_m}m {_s}s ({eval_elapsed:.1f}s)")
     plain_sep = (
         "================================================================================\n"
         f"{ts} | run_id={run_id} | task_idx={task_idx} | pipeline={pipeline}\n"
+        f"eval_export_tag={eval_export_tag} decode={dc.get('decode_strategy')} temp={dc.get('generate_temperature')} top_p={dc.get('generate_top_p')}\n"
         f"{domain_from} -> {domain_to}\n"
         f"log_file={row['log_file']}\n"
         f"save_file={row['save_file']}\n"

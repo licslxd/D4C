@@ -1,0 +1,6 @@
+decode_strategy: nucleus
+generate_temperature: 0.8
+generate_top_p: 0.9
+repetition_penalty: 1.15
+decode_seed: 3407
+max_explanation_length: 25

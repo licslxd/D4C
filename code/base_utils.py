@@ -128,9 +128,10 @@ def evaluate_text(predictions, references):
     """
     # compute bleu
     # compute rouge
-    # compute distinct
+    # compute distinct（语料级 n-gram distinct，×100；论文主表 DIST-1/DIST-2 口径；
+    #   与 d4c_eval_metrics.extended_text_metrics_bundle 中的 distinct 定义不同，勿混读）
     # compute meteor
-    
+
     def distinct_score(sentences, n):
         sentences = [word_tokenize(sentence) for sentence in sentences]
         unique_ngrams = set()

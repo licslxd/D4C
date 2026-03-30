@@ -10,9 +10,12 @@ env/
 .coverage
 htmlcov/
 
-# Slurm / 集群
+# Slurm / 集群 / 运行残留
 slurm-*.out
+*.out
 *.err
+# 若有人在仓库根误生成 manifest（正常应在 log/ 下，log/ 已忽略）
+/d4c_run_manifest.json
 
 # 系统/编辑器
 .DS_Store
@@ -40,7 +43,6 @@ tmux-slurm/
 *.tar.gz
 *.zip
 *.tar
-nohup.out
 nohup.out
 cache/
 __pycache__/

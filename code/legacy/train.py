@@ -1,18 +1,22 @@
 """
+LEGACY / NOT PART OF THE NEW MAINLINE
+
 DEPRECATED — not part of the supported DDP pipeline.
 
 This file is kept only for historical / experimental reference. There is no
 guarantee of compatibility with current main scripts (torchrun + AdvTrain.py /
 run-d4c.py / generate_counterfactual.py). Do not use it for reproduction.
 
-正式 Step 3：torchrun --standalone --nproc_per_node=K AdvTrain.py train ...
-（K=1 仍为 DDP smoke，非「非分布式模式」。）
+正式 Step 5：torchrun ... run-d4c.py train ...（Step 3 见项目脚本；勿使用本文件）。
 """
 import os
 import sys
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_LEGACY_DIR = os.path.dirname(os.path.abspath(__file__))
+_CODE_DIR = os.path.dirname(_LEGACY_DIR)
+if _CODE_DIR not in sys.path:
+    sys.path.insert(0, _CODE_DIR)
 from base_utils import *
 from paths_config import T5_SMALL_DIR, DATA_DIR
 from config import get_dataloader_num_workers, get_dataloader_prefetch_factor
@@ -329,7 +333,7 @@ def validModel(model, valid_dataloader, device):
             user_idx, item_idx, rating, tgt_input, tgt_output = _model.gather(batch, device, False)
             pred_rating, context_dist, word_dist = model(user_idx, item_idx, tgt_input)
             loss_r = _model.rating_loss_fn(pred_rating, rating)
-            loss_e = _model.exp_loss_fn(word_dist.view(-1, 32128), tgt_output.reshape(-1))
+            loss_e = _model.exp_loss_fn(word_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
             loss = loss_r + loss_e
             avg_loss += loss.item()
         avg_loss /= len(valid_dataloader)
@@ -411,7 +415,7 @@ if __name__ == "__main__":
             "epochs": args.epochs,
             "seed": args.seed,
             "batch_size": 128, 
-            "ntoken": 32128,
+            "ntoken": len(tokenizer),
             "emsize": 768,
             "nhead": 2, 
             "nhid": 2048,

@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # -----------------------------------------------------------------------------
-# 兼容入口（推荐后续收敛至）：bash scripts/train_ddp.sh — 见 docs/D4C_RUNTIME_SPEC.md
+# MAINLINE: python code/d4c.py step3 …（项目根）；本脚本仅做 GPU / nohup / 批量循环 / 环境默认值。
+# Bash 统一派发: bash scripts/train_ddp.sh --step 3 …（同样调 d4c.py）
 # -----------------------------------------------------------------------------
 #
 # run_step3_optimized.sh — Step 3 正式入口：域对抗预训练（torchrun + DDP）
@@ -16,11 +17,11 @@
 # ---------------------------------------------------------------------------
 #   --task N          只跑任务 N（1–8）
 #   --all             顺序跑全部 8 个任务
-#   --eval-only       只跑 AdvTrain.py eval（跳过 train；需已有对应 checkpoint）
-#   --train-only      只跑 AdvTrain.py train（跳过训练后的 AdvTrain.py eval；与 --eval-only 互斥）
+#   --eval-only       只跑 step3 runner 的 eval（跳过 train；需已有对应 checkpoint）
+#   --train-only      只跑 step3 runner 的 train（跳过训练后的 eval；与 --eval-only 互斥）
 #   --from N          仅配合 --all：从任务 N 开始（前面的跳过）
 #   --skip a,b,...    跳过指定任务号
-#   --batch-size / --epochs / --num-proc  传给 AdvTrain（与 config 一致时可省略部分）
+#   --batch-size / --epochs / --num-proc  转发给 d4c step3（与 config 一致时可省略部分）
 #   --ddp-nproc K     DDP 进程数（也可用环境变量 DDP_NPROC，默认 2）；=1 为单卡 DDP smoke，仍为同一主路径
 #   --daemon / --bg   后台：单任务 Python 日志 log/<task>/.../runs/<秒级时间戳>/train.log，nohup 同目录 nohup.log
 #
@@ -54,12 +55,13 @@ SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 D4C_ROOT="$(cd "$SH_DIR/.." && pwd)"
 CODE_DIR="$D4C_ROOT/code"
 SCRIPT_PATH="$SH_DIR/$(basename "${BASH_SOURCE[0]}")"
-cd "$CODE_DIR"
+export D4C_ROOT
+cd "$D4C_ROOT"
 export NLTK_DATA="${D4C_ROOT}/pretrained_models/nltk_data"
 LOG_DIR="$D4C_ROOT/log"
 mkdir -p "$LOG_DIR"
 
-# ---- 训练语义默认值（与 config / AdvTrain 环境变量一致）----
+# ---- 训练语义默认值（与 config / step3 环境变量一致）----
 export D4C_LR_SCHEDULER="${D4C_LR_SCHEDULER:-warmup_cosine}"
 export D4C_WARMUP_RATIO="${D4C_WARMUP_RATIO:-0.05}"
 export D4C_QUICK_EVAL_MAX_SAMPLES="${D4C_QUICK_EVAL_MAX_SAMPLES:-512}"
@@ -73,21 +75,10 @@ if [ -z "${D4C_LOG_GROUP:-}" ] && [ -z "${D4C_LOG_SUBDIR:-}" ] && [ -z "${D4C_LO
     export D4C_LOG_GROUP=step3_optimized
 fi
 
-d4c_run_log_dir() {
-    python -c "from paths_config import get_log_task_dir; import os; print(get_log_task_dir($1))"
-}
-d4c_run_log_path() {
-    python -c "from paths_config import get_log_task_dir; import os; print(os.path.join(get_log_task_dir($1), 'runs', 'run', 'train.log'))"
-}
+# 与 d4c.py step3 解析的 log_dir 一致（便于 tail/nohup 提示）
 d4c_step3_logfile() {
     local tid=$1
-    local base
-    base="$(d4c_run_log_dir "$tid")"
-    if [ "${D4C_LOG_USE_TIMESTAMP:-1}" != "0" ]; then
-        echo "${base}/runs/${_LOG_TS}/train.log"
-    else
-        d4c_run_log_path "$tid"
-    fi
+    echo "${D4C_ROOT}/log/${tid}/step3_optimized/${D4C_CHECKPOINT_SUBDIR}/train.log"
 }
 
 if [ "${1:-}" = "_DAEMON_CHILD_" ]; then
@@ -99,30 +90,10 @@ if [ "${1:-}" = "_DAEMON_CHILD_" ]; then
 fi
 
 DDP_NPROC="${DDP_NPROC:-2}"
-TORCHRUN_BIN=""
-
-resolve_torchrun() {
-    if command -v torchrun >/dev/null 2>&1; then
-        TORCHRUN_BIN="torchrun"
-        return 0
-    fi
-    if python -c "import torch" >/dev/null 2>&1; then
-        TORCHRUN_BIN="python -m torch.distributed.run"
-        echo "提示: 未找到 torchrun，自动回退到: ${TORCHRUN_BIN}"
-        return 0
-    fi
-    echo "错误: 当前环境既没有 torchrun，也无法 'python -c \"import torch\"'。"
-    echo "      请先激活安装了 PyTorch 的环境后重试。"
-    exit 1
-}
 
 BATCH_SIZE=""
 EPOCHS=""
 NUM_PROC=""
-
-get_task_params() {
-    python -c "from config import TASK_DEFAULTS; import sys; t=int(sys.argv[1]); c=TASK_DEFAULTS[t]; sys.stdout.write('{} {} {} {} {}'.format(c['auxiliary'], c['target'], c['lr'], c['coef'], c['adv'])); sys.exit(0)" "$1"
-}
 
 MODE=""
 TASK_ID=""
@@ -200,7 +171,7 @@ fi
     echo "  --eval-only：只跑 eval，跳过 train（须已有训练产物）"
     echo "  --train-only：只 train，跳过训练后的 eval（与 --eval-only 互斥）"
     echo "  --daemon / --bg：后台运行；详见文件头"
-    echo "  DDP：torchrun AdvTrain.py train；DDP_NPROC 或 --ddp-nproc（默认 2）"
+    echo "  DDP：d4c.py 内部 torchrun；DDP_NPROC 或 --ddp-nproc（默认 2）"
     exit 1
 }
 
@@ -252,62 +223,26 @@ if [ -n "$DAEMON" ] && [ -z "${INTERNAL_NOHUP:-}" ]; then
     exit 0
 fi
 
-resolve_torchrun
-
-_adv_train() {
-    local _cmd=$1
-    if [ "${#_extra[@]}" -gt 0 ]; then
-        ${TORCHRUN_BIN} --standalone --nproc_per_node="$DDP_NPROC" AdvTrain.py "$_cmd" \
-            --auxiliary "$aux" --target "$tgt" $_epochs_arg --learning_rate "$lr" --coef "$coef" --adv "$adv" \
-            $BATCH_SIZE $NUM_PROC "${_extra[@]}" \
-            --log_file "$LOGFILE"
-    else
-        ${TORCHRUN_BIN} --standalone --nproc_per_node="$DDP_NPROC" AdvTrain.py "$_cmd" \
-            --auxiliary "$aux" --target "$tgt" $_epochs_arg --learning_rate "$lr" --coef "$coef" --adv "$adv" \
-            $BATCH_SIZE $NUM_PROC \
-            --log_file "$LOGFILE"
-    fi
-}
-
 run_one_task() {
     local idx=$1
-    local p
-    p=$(get_task_params "$idx")
-    [ -z "$p" ] && { echo "无效任务 $idx"; return 1; }
-    aux=$(echo "$p" | cut -d' ' -f1)
-    tgt=$(echo "$p" | cut -d' ' -f2)
-    lr=$(echo "$p" | cut -d' ' -f3)
-    coef=$(echo "$p" | cut -d' ' -f4)
-    adv=$(echo "$p" | cut -d' ' -f5)
-    _epochs_arg=""
-    if [ -z "$EVAL_ONLY" ]; then
-        if [ -n "$EPOCHS" ]; then
-            _epochs_arg="$EPOCHS"
-        else
-            _epochs_arg="--epochs $(cd "$CODE_DIR" && D4C_PRESET_TASK_ID="$idx" python -c "from config import get_epochs; print(get_epochs())")"
-        fi
-    fi
+    [[ "$idx" =~ ^[1-8]$ ]] || { echo "无效任务 $idx"; return 1; }
+    local PRESET="${D4C_TRAIN_PRESET:-step3}"
+    local _eo=() _to=()
+    [ -n "$EVAL_ONLY" ] && _eo=(--eval-only)
+    [ -n "$TRAIN_ONLY" ] && _to=(--train-only)
     if [ -n "$EVAL_ONLY" ]; then
-        echo "========== Step 3 DDP Task $idx 仅 eval (nproc=$DDP_NPROC): $aux -> $tgt =========="
+        echo "========== Step 3 Task $idx 仅 eval（d4c.py, DDP nproc=$DDP_NPROC）=========="
     elif [ -n "$TRAIN_ONLY" ]; then
-        echo "========== Step 3 DDP Task $idx 仅 train (nproc=$DDP_NPROC): $aux -> $tgt =========="
+        echo "========== Step 3 Task $idx 仅 train（d4c.py, DDP nproc=$DDP_NPROC）=========="
     else
-        echo "========== Step 3 DDP Task $idx (nproc=$DDP_NPROC): $aux -> $tgt =========="
+        echo "========== Step 3 Task $idx（d4c.py, DDP nproc=$DDP_NPROC）=========="
     fi
-    if [ -z "$EVAL_ONLY" ]; then
-        _adv_train train
-    fi
-    if [ -z "$TRAIN_ONLY" ]; then
-        if [ "${#_extra[@]}" -gt 0 ]; then
-            ${TORCHRUN_BIN} --standalone --nproc_per_node="$DDP_NPROC" AdvTrain.py eval \
-                --auxiliary "$aux" --target "$tgt" $BATCH_SIZE $NUM_PROC "${_extra[@]}" \
-                --log_file "$LOGFILE"
-        else
-            ${TORCHRUN_BIN} --standalone --nproc_per_node="$DDP_NPROC" AdvTrain.py eval \
-                --auxiliary "$aux" --target "$tgt" $BATCH_SIZE $NUM_PROC \
-                --log_file "$LOGFILE"
-        fi
-    fi
+    # shellcheck disable=SC2086
+    D4C_PRESET_TASK_ID="$idx" python "$D4C_ROOT/code/d4c.py" step3 --task "$idx" --preset "$PRESET" \
+        --run-name "${D4C_CHECKPOINT_SUBDIR}" \
+        --ddp-world-size "$DDP_NPROC" \
+        $BATCH_SIZE $EPOCHS $NUM_PROC "${_extra[@]}" \
+        "${_eo[@]}" "${_to[@]}"
 }
 
 should_skip() { [[ " $SKIP_LIST " =~ " $1 " ]]; }

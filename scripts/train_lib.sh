@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# D4C — 训练入口公共库：fail-fast 校验与派发（由 scripts/train_ddp.sh source）
+# D4C — Bash 包装公共库：fail-fast 校验与派发至 sh/（由 scripts/train_ddp.sh source）
+# MAINLINE ENTRY（Python）: python code/d4c.py …；本库为 Shell 编排，GPU/DDP 校验后调用 d4c（torchrun 在 Python 内分发 step runner）。
 #
 # 设计约束：
 # - --gpus → 仅 CUDA_VISIBLE_DEVICES；--ddp-nproc → 仅 DDP_NPROC + 透传子脚本
@@ -10,14 +11,18 @@ set -euo pipefail
 
 d4c_train_usage() {
     cat <<'EOF'
+说明: 本命令为 Shell 编排/校验层（GPU/CVD/DDP 校验后调用 python code/d4c.py）。
+日常实验请优先在项目根执行:
+  python code/d4c.py step3|step4|step5|eval|pipeline …（由 d4c 分发到各 step runner；见 python code/d4c.py --help）
+
 用法: bash scripts/train_ddp.sh [选项]
 
-  --step 3|4|5           单步：调用 sh/run_step{3,4,5}_optimized.sh（4/5 须 --step3-subdir）
-  --pipeline 3,4,5      按 3→4→5 顺序执行子集（例 3,4 或 4,5 或 3,4,5；去重后排序）
+  --step 3|4|5           单步：python code/d4c.py step{3,4,5} …（4/5 须 --step3-subdir）
+  --pipeline 3,4,5      按 3→4→5 顺序执行子集（内部为多次 d4c.py 调用；去重后排序）
   --task N               任务 1–8（必填）
   --step3-subdir NAME    无 Step 3 的 pipeline（如 4,5）或单步 4/5 时必填；含 Step 3 时可省略（Step 4/5 用本轮 Step 3 产生的最新 step3_opt_*）
   --gpus LIST            仅设置 CUDA_VISIBLE_DEVICES（例 0,1）
-  --ddp-nproc K          设置 DDP_NPROC，并 --ddp-nproc 透传子脚本；未传则用环境变量或默认 2 参与校验
+  --ddp-nproc K          设置 DDP_NPROC，并映射为 d4c.py 的 --ddp-world-size；未传则用环境变量或默认 2 参与校验
   --train-preset NAME    → D4C_TRAIN_PRESET
   --runtime-preset NAME  → D4C_RUNTIME_PRESET
   --batch-size N         转发 --batch-size；若指定则须能被 DDP_NPROC 整除
@@ -29,7 +34,13 @@ d4c_train_usage() {
   bash scripts/train_ddp.sh --pipeline 3,4,5 --task 4 --ddp-nproc 2 --gpus 0,1 --batch-size 1024
   bash scripts/train_ddp.sh --pipeline 4,5 --task 4 --step3-subdir step3_opt_20260325_1503 --ddp-nproc 2
 
-兼容：可直接使用 sh/run_step*_optimized.sh（见 docs/D4C_RUNTIME_SPEC.md）。
+兼容：可直接使用 sh/run_step*_optimized.sh（内部同样调 d4c.py；见 docs/D4C_Scripts_and_Runtime_Guide.md）。
+
+Step 5 多随机种子（串行、独立嵌套目录与 --seed）:
+  bash scripts/run_step5_multi_seed.sh --task N --step3-subdir step3_opt_… [其它 Step5 选项…]
+  等价于 bash sh/run_step5_multi_seed.sh …；环境变量 D4C_MULTI_SEEDS / D4C_MULTI_SEED_RUN_ID 等见 sh 脚本。
+
+论文表 mean±std: python scripts/multi_seed_paper_stats.py --logs log/multi_seed_runs/<RUN_ID>/train_seed_*.log
 EOF
 }
 
@@ -274,11 +285,11 @@ d4c_train_main() {
         export D4C_RUNTIME_PRESET="$runtime_preset"
     fi
 
-    local sh_dir="${d4c_root}/sh"
+    local py_d4c="${d4c_root}/code/d4c.py"
+    local preset_train="${D4C_TRAIN_PRESET:-step3}"
     local extra_bs=()
     [[ -n "$batch_size" ]] && extra_bs=(--batch-size "$batch_size")
-    local extra_ddp=()
-    [[ -n "$ddp_cli" ]] && extra_ddp=(--ddp-nproc "$ddp_cli")
+    local extra_ddp_ws=(--ddp-world-size "$effective_ddp")
 
     local summary_step3_display=""
     local mode_label="step"
@@ -310,17 +321,20 @@ d4c_train_main() {
         for s in $_d4c_pl_ordered; do
             case "$s" in
                 3)
-                    bash "${sh_dir}/run_step3_optimized.sh" --task "$task" "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp[@]+"${extra_ddp[@]}"}"
+                    python "$py_d4c" step3 --task "$task" --preset "$preset_train" \
+                        "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp_ws[@]+"${extra_ddp_ws[@]}"}"
                     cur_sub="$(d4c_train_latest_step3_subdir_or_die "$d4c_root" "$task")"
                     d4c_train_log "Step 3 完成，解析 step3-subdir: $cur_sub"
                     ;;
                 4)
                     d4c_train_validate_step3_subdir "$d4c_root" "$task" "$cur_sub"
-                    bash "${sh_dir}/run_step4_optimized.sh" --task "$task" --step3-subdir "$cur_sub" "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp[@]+"${extra_ddp[@]}"}"
+                    python "$py_d4c" step4 --task "$task" --preset "$preset_train" --from-run "$cur_sub" \
+                        "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp_ws[@]+"${extra_ddp_ws[@]}"}"
                     ;;
                 5)
                     d4c_train_validate_step3_subdir "$d4c_root" "$task" "$cur_sub"
-                    bash "${sh_dir}/run_step5_optimized.sh" --task "$task" --step3-subdir "$cur_sub" "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp[@]+"${extra_ddp[@]}"}"
+                    python "$py_d4c" step5 --task "$task" --preset step5 --from-run "$cur_sub" \
+                        "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp_ws[@]+"${extra_ddp_ws[@]}"}"
                     ;;
             esac
         done
@@ -344,13 +358,16 @@ d4c_train_main() {
 
     case "$step" in
         3)
-            exec bash "${sh_dir}/run_step3_optimized.sh" --task "$task" "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp[@]+"${extra_ddp[@]}"}"
+            exec python "$py_d4c" step3 --task "$task" --preset "$preset_train" \
+                "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp_ws[@]+"${extra_ddp_ws[@]}"}"
             ;;
         4)
-            exec bash "${sh_dir}/run_step4_optimized.sh" --task "$task" --step3-subdir "$step3_subdir" "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp[@]+"${extra_ddp[@]}"}"
+            exec python "$py_d4c" step4 --task "$task" --preset "$preset_train" --from-run "$step3_subdir" \
+                "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp_ws[@]+"${extra_ddp_ws[@]}"}"
             ;;
         5)
-            exec bash "${sh_dir}/run_step5_optimized.sh" --task "$task" --step3-subdir "$step3_subdir" "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp[@]+"${extra_ddp[@]}"}"
+            exec python "$py_d4c" step5 --task "$task" --preset step5 --from-run "$step3_subdir" \
+                "${extra_bs[@]+"${extra_bs[@]}"}" "${extra_ddp_ws[@]+"${extra_ddp_ws[@]}"}"
             ;;
     esac
 }

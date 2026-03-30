@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# 兼容入口（推荐后续收敛至）：bash scripts/train_ddp.sh — 见 docs/D4C_RUNTIME_SPEC.md
+# Python 单任务 Step5: python code/d4c.py step5|eval …；本脚本为 **多任务 1–8 批量** Shell 编排（内部 torchrun INTERNAL EXECUTOR）
+# 亦见: bash scripts/train_ddp.sh — docs/D4C_Scripts_and_Runtime_Guide.md
 # -----------------------------------------------------------------------------
 # Step 5 批量：对任务 1–8 依次调用 run_step5_optimized.sh（仅嵌套 checkpoint；每任务自动选最新 step3_opt_*；--eval-only 时再选最新 step5_opt_*）
 # 用法: bash run_step5_all.sh [--from N] [--skip N,M,...] [--eval-only|--train-only] [--batch-size N] [--epochs N] [--num-proc N] [--ddp-nproc K] [--daemon|--bg]

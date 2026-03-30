@@ -1,4 +1,6 @@
 """
+LEGACY / NOT PART OF THE NEW MAINLINE
+
 DEPRECATED — not part of the supported DDP pipeline.
 
 Kept only for historical / experimental reference. No guarantee of compatibility
@@ -10,7 +12,10 @@ import os
 import sys
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_LEGACY_DIR = os.path.dirname(os.path.abspath(__file__))
+_CODE_DIR = os.path.dirname(_LEGACY_DIR)
+if _CODE_DIR not in sys.path:
+    sys.path.insert(0, _CODE_DIR)
 from base_utils import *
 from paths_config import T5_SMALL_DIR, DATA_DIR, MERGED_DATA_DIR
 import torch
@@ -214,8 +219,8 @@ def trainModel(model, train_dataloader, valid_dataloader, config):
             user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = _model.gather(batch, config["device"])
             pred_rating, context_dist, word_dist = model(user_idx, item_idx, tgt_input, domain_idx)
             loss_r = _model.rating_loss_fn(pred_rating, rating)
-            loss_e = _model.exp_loss_fn(word_dist.view(-1, 32128), tgt_output.reshape(-1))
-            loss_c = _model.exp_loss_fn(context_dist.view(-1, 32128), tgt_output.reshape(-1))
+            loss_e = _model.exp_loss_fn(word_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
+            loss_c = _model.exp_loss_fn(context_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
             loss = coef*loss_r + coef*loss_c + loss_e
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1)
@@ -256,7 +261,7 @@ def validModel(model, valid_dataloader, device):
             user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = _model.gather(batch, device)
             pred_rating, context_dist, word_dist = model(user_idx, item_idx, tgt_input, domain_idx)
             loss_r = _model.rating_loss_fn(pred_rating, rating)
-            loss_e = _model.exp_loss_fn(word_dist.view(-1, 32128), tgt_output.reshape(-1))
+            loss_e = _model.exp_loss_fn(word_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
             loss = loss_r + loss_e
             avg_loss += loss.item()
         avg_loss /= len(valid_dataloader)
@@ -335,7 +340,7 @@ if __name__ == "__main__":
         "emsize": 768,
         "nlayers": args.nlayers,
         "nhid": 2048,
-        "ntoken": 32128,
+        "ntoken": len(tokenizer),
         "dropout": 0.2,
         "nuser": nuser,
         "nitem": nitem, 

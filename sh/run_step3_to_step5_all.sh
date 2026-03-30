@@ -1,15 +1,17 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# 兼容入口：全任务 3→4→5 仍用本脚本；单任务可用 scripts/train_ddp.sh --pipeline 3,4,5（见 docs/D4C_RUNTIME_SPEC.md）
+# 全任务 1–8 串联：本脚本为 Shell 批量编排（内部 torchrun INTERNAL EXECUTOR）。
+# 单任务串联首选: python code/d4c.py pipeline --task N --preset step3；或 scripts/train_ddp.sh --pipeline 3,4,5
+# 见 docs/D4C_Scripts_and_Runtime_Guide.md
 # -----------------------------------------------------------------------------
 # Step 3-5 全部任务：域对抗预训练 → 生成反事实 → 主训练（顺序执行）
 # 用法: bash run_step3_to_step5_all.sh [--from N] [--skip N,M,...] [--eval-only|--train-only] [--batch-size N] [--epochs N] [--num-proc N] [--ddp-nproc K] [--daemon|--bg]
 #
-#   --eval-only  Step 3 只跑 AdvTrain eval；Step 5 只跑 run-d4c 评估（均不重训），见 run_step3_optimized.sh / run_step5_optimized.sh
+#   --eval-only  Step 3 只跑 step3 runner eval；Step 5 只跑 step5 runner 评估（均不重训），见 run_step3_optimized.sh / run_step5_optimized.sh
 #   --train-only Step 3 / Step 5 跳过训练后收尾 eval（与 --eval-only 互斥）
 #
 # ========== DDP（Step 3、Step 4、Step 5）==========
-# Step 3：torchrun + AdvTrain；Step 4：torchrun + generate_counterfactual.py；Step 5：torchrun + run-d4c.py。
+# Step 3/4/5：均由 python code/d4c.py 分发到对应 step runner（torchrun 在 Python 内完成）。
 # 进程数由 DDP_NPROC 或 --ddp-nproc K 传给上述脚本（默认 2）；Step 4 与 3/5 一致须整除全局 batch。
 # 单卡请 DDP_NPROC=1 或 --ddp-nproc 1。
 # 示例:

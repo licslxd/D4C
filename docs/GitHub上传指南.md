@@ -2,6 +2,8 @@
 
 > 适用于无外网的计算节点 + 有外网的登录节点环境
 
+克隆后请先读根目录 **`README.md`**（快速开始、产物与排障）。训练入口：`python code/d4c.py …`（项目根）。配置见 **`docs/PRESETS.md`**，脚本规范见 **`docs/D4C_Scripts_and_Runtime_Guide.md`**。
+
 ## 前提条件
 
 - 登录节点（admin）可以访问外网

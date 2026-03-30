@@ -1,6 +1,7 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# 兼容入口（推荐后续训练主路径收敛至）：bash scripts/train_ddp.sh — 见 docs/D4C_RUNTIME_SPEC.md
+# Python 推荐入口: python code/d4c.py …（Step3+ 见主文档）；本脚本为 Step1+2 Shell 编排（非 torchrun 执行体）。
+# 批量训练包装亦可: bash scripts/train_ddp.sh — 见 docs/D4C_Scripts_and_Runtime_Guide.md
 # -----------------------------------------------------------------------------
 # Step 1 + Step 2 合并脚本：数据预处理 + 嵌入与域语义
 # 用法: bash run_step1_step2.sh [--embed-batch-size N] [--cuda-device N] [--daemon|--bg]

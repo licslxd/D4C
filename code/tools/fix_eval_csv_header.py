@@ -5,9 +5,9 @@
 （最后一列应为 eval_elapsed_s，而非历史误写的 bert）。
 
 用法（在项目根目录）:
-  python code/fix_eval_csv_header.py
-  python code/fix_eval_csv_header.py log/step3/eval/eval_runs_all.csv log/step5/eval/eval_runs_all.csv
-  python code/fix_eval_csv_header.py --dry-run
+  python code/tools/fix_eval_csv_header.py
+  python code/tools/fix_eval_csv_header.py log/step3/eval/eval_runs_all.csv log/step5/eval/eval_runs_all.csv
+  python code/tools/fix_eval_csv_header.py --dry-run
 """
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ import argparse
 import os
 import sys
 
-_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+_CODE_DIR = os.path.dirname(_TOOLS_DIR)
 if _CODE_DIR not in sys.path:
     sys.path.insert(0, _CODE_DIR)
 

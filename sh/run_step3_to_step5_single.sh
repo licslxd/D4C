@@ -1,11 +1,13 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
-# 兼容入口：单任务 3→4→5 可用 bash scripts/train_ddp.sh --pipeline 3,4,5 --task N（见 docs/D4C_RUNTIME_SPEC.md）
+# Python 串联首选: python code/d4c.py pipeline --task N --preset step3（仓库根；Step5 内建 preset=step5）
+# 本脚本: Shell 批量编排 → 内部 torchrun INTERNAL EXECUTOR；亦可 bash scripts/train_ddp.sh --pipeline 3,4,5
+# 见 docs/D4C_Scripts_and_Runtime_Guide.md
 # -----------------------------------------------------------------------------
 # Step 3-5 单个任务：域对抗预训练 → 生成反事实 → 主训练（顺序执行）
 # 用法: bash run_step3_to_step5_single.sh --task N [--from 3|4|5] [--eval-only|--train-only] [--batch-size N] [--epochs N] [--num-proc N] [--ddp-nproc K] [--daemon|--bg]
 #
-#   --eval-only  Step 3 只跑 AdvTrain eval；Step 5 只跑 run-d4c 评估（均不重训），见 run_step3_optimized.sh / run_step5_optimized.sh
+#   --eval-only  Step 3 只跑 step3 runner eval；Step 5 只跑 step5 runner 评估（均不重训），见 run_step3_optimized.sh / run_step5_optimized.sh
 #   --train-only Step 3 / Step 5 跳过训练后的收尾 eval（与 --eval-only 互斥）
 #
 # ========== DDP（Step 3、Step 4、Step 5）==========

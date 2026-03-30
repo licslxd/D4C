@@ -1,0 +1,8 @@
+# 默认 decode 预设名（--decode-preset default 或省略时）。与 greedy.yaml 浅层合并后当前与 greedy 等价（均为 greedy + 下列标量）。
+decode_strategy: greedy
+decode_seed: null
+max_explanation_length: 25
+label_smoothing: 0.1
+repetition_penalty: 1.15
+generate_temperature: 0.8
+generate_top_p: 0.9

@@ -184,23 +184,42 @@ def d4c_save_checkpoint(
     reason: str,
     logger: Optional[logging.Logger] = None,
     route_detail: str = ROUTE_DETAIL,
+    is_last: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     p = os.path.abspath(os.path.expanduser(path))
     d = os.path.dirname(p)
     if d:
         os.makedirs(d, exist_ok=True)
     torch.save(state_dict, p)
+    if not os.path.isfile(p):
+        raise RuntimeError(f"[Checkpoint] save failed: file missing after torch.save: {p}")
+    sz = os.path.getsize(p)
+    if metadata is not None:
+        meta_path = os.path.splitext(p)[0] + ".checkpoint_meta.json"
+        try:
+            payload: Dict[str, Any] = {
+                "epoch": int(epoch),
+                "reason": str(reason),
+                "checkpoint_path": p,
+                "checkpoint_size_bytes": int(sz),
+            }
+            payload.update(metadata)
+            with open(meta_path, "w", encoding="utf-8") as mf:
+                json.dump(payload, mf, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            pass
+    if is_last:
+        msg = f"[Checkpoint] saved last checkpoint to {p} size={sz}"
+    else:
+        msg = f"[Checkpoint] saved checkpoint to {p} size={sz} epoch={int(epoch)} reason={reason}"
     if logger is not None:
         try:
-            logger.info(
-                "[Checkpoint] path=%s epoch=%d reason=%s",
-                p,
-                int(epoch),
-                reason,
-                extra=log_route_extra(logger, route_detail),
-            )
+            logger.info(msg, extra=log_route_extra(logger, route_detail))
         except Exception:
-            logger.info("[Checkpoint] path=%s epoch=%d reason=%s", p, int(epoch), reason)
+            logger.info(msg)
+    else:
+        print(msg, flush=True)
 
 
 def ddp_heartbeat(

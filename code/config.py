@@ -21,7 +21,7 @@ from cpu_utils import effective_cpu_count
 from training_runtime_inputs import collect_training_runtime_overrides_from_args
 
 # 执行层：DDP_NPROC / torchrun --nproc_per_node 仅在 shell 解析；Python 以 WORLD_SIZE 为准。
-# D4C_NUM_PROC 为 CPU 侧（如 datasets.map）并行度，属 runtime 链，勿与 DDP_NPROC 混淆。详见 docs/D4C_RUNTIME_SPEC.md。
+# D4C_NUM_PROC 为 CPU 侧（如 datasets.map）并行度，属 runtime 链，勿与 DDP_NPROC 混淆。详见 docs/D4C_Scripts_and_Runtime_Guide.md。
 
 # import 后由 train_logging.flush_preset_load_events 写入训练日志（摘要侧）
 PRESET_LOAD_EVENTS: List[str] = []
@@ -652,6 +652,7 @@ _RUNTIME_PRESET_ALLOWED_KEYS: FrozenSet[str] = frozenset(
     {
         "max_parallel_cpu",
         "num_proc",
+        "ddp_world_size",
         "dataloader_num_workers_train",
         "dataloader_num_workers_valid",
         "dataloader_num_workers_test",
@@ -686,6 +687,8 @@ def _validate_runtime_presets(presets: Dict[str, Any], *, name: str = "RUNTIME_P
                     raise ValueError(f"{name} 预设 {preset_name!r} 字段 {k!r} 不可为负，当前为 {iv}")
                 if k == "num_proc" and iv < 1:
                     raise ValueError(f"{name} 预设 {preset_name!r} num_proc 须 >= 1，当前为 {iv}")
+                if k == "ddp_world_size" and iv < 1:
+                    raise ValueError(f"{name} 预设 {preset_name!r} ddp_world_size 须 >= 1，当前为 {iv}")
 
 
 _RUNTIME_PRESETS_BUILTIN: Dict[str, Dict[str, int]] = {
@@ -1104,9 +1107,17 @@ class FinalTrainingConfig:
     emsize: int = 768
     nlayers: int = 2
     nhid: int = 2048
+    # 词表大小在 run-d4c 入口用 len(tokenizer) 覆盖；此处仅作占位默认值
     ntoken: int = 32128
     dropout: float = 0.2
     nhead: int = 2
+    label_smoothing: float = 0.1
+    repetition_penalty: float = 1.15
+    generate_temperature: float = 0.8
+    generate_top_p: float = 0.9
+    max_explanation_length: int = 25
+    decode_strategy: str = "greedy"
+    decode_seed: Optional[int] = None
     nuser: int = 0
     nitem: int = 0
 

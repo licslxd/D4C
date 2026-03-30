@@ -1,0 +1,7 @@
+# 显式 greedy 组；与 default.yaml 合并后字段与仅 default 时一致，manifest 中 decode_preset 为 greedy。
+decode_strategy: greedy
+generate_temperature: 0.8
+generate_top_p: 0.9
+repetition_penalty: 1.15
+decode_seed: null
+max_explanation_length: 25
