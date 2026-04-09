@@ -1,0 +1,6 @@
+# 小规模 rerank 探针
+hardware_preset: hw_1gpu_fast
+decode_preset: decode_candidate_nucleus_v2
+rerank_preset: rerank_v3_default
+eval_batch_size: 128
+num_return_sequences: 3

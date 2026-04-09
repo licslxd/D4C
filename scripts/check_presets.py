@@ -61,7 +61,7 @@ def main() -> int:
     from config import (
         _coerce_training_preset_top_level,
         _normalize_task_row_yaml,
-        _validate_runtime_presets,
+        _validate_hardware_presets,
         _validate_training_presets,
     )
 
@@ -108,20 +108,20 @@ def main() -> int:
         if training_any_error:
             failed = True
 
-    # --- runtime ---
-    rdir = repo / "presets" / "runtime"
+    # --- hardware (dataloader / ddp / threads) ---
+    rdir = repo / "presets" / "hardware"
     rpaths = _glob_yaml(rdir)
     if not rpaths:
-        print("[check_presets] presets/runtime: 无 .yaml/.yml，跳过（运行时使用内置 RUNTIME_PRESETS）")
+        print("[check_presets] presets/hardware: 无 .yaml/.yml，跳过（运行时使用内置 HARDWARE_PRESETS）")
     else:
         rmerged: Dict[str, Any] = {}
-        runtime_any_error = False
+        hardware_any_error = False
         for path in rpaths:
             stem = path.stem
             ok, reason = _preset_stem_ok(stem)
             if not ok:
-                _die(f"runtime 非法预设名 {path.name}: {reason}")
-                runtime_any_error = True
+                _die(f"hardware 非法预设名 {path.name}: {reason}")
+                hardware_any_error = True
                 continue
             try:
                 raw = load_mapping(path)
@@ -131,15 +131,15 @@ def main() -> int:
                     raise TypeError(f"根须为 dict，当前为 {type(raw).__name__}")
                 rmerged[stem] = raw
             except Exception as e:
-                _die(f"runtime {path.relative_to(repo)}: {e}")
-                runtime_any_error = True
+                _die(f"hardware {path.relative_to(repo)}: {e}")
+                hardware_any_error = True
         if rmerged:
             try:
-                _validate_runtime_presets(rmerged, name="presets/runtime")
+                _validate_hardware_presets(rmerged, name="presets/hardware")
             except Exception as e:
-                _die(f"runtime 结构校验: {e}")
-                runtime_any_error = True
-        if runtime_any_error:
+                _die(f"hardware 结构校验: {e}")
+                hardware_any_error = True
+        if hardware_any_error:
             failed = True
 
     # --- tasks ---
@@ -175,6 +175,50 @@ def main() -> int:
                 tasks_any_error = True
         if tasks_any_error:
             failed = True
+
+    # --- eval_profiles ---
+    epdir = repo / "presets" / "eval_profiles"
+    epaths = _glob_yaml(epdir)
+    if not epaths:
+        _die("presets/eval_profiles: 无 .yaml/.yml（新版主线必须存在）")
+        failed = True
+    else:
+        eval_any_error = False
+        allowed = {"hardware_preset", "decode_preset", "rerank_preset", "eval_batch_size", "num_return_sequences"}
+        forbidden = {"train_batch_size", "per_device_train_batch_size", "gradient_accumulation_steps"}
+        for path in epaths:
+            try:
+                raw = load_mapping(path)
+                if not isinstance(raw, dict):
+                    raise TypeError(f"根须为 dict，当前为 {type(raw).__name__}")
+                extra = set(raw.keys()) - allowed
+                if extra:
+                    raise ValueError(f"含非法字段: {sorted(extra)}")
+                bad = sorted(k for k in forbidden if k in raw)
+                if bad:
+                    raise ValueError(f"包含 training 字段（禁止）: {bad}")
+                if "eval_batch_size" not in raw:
+                    raise ValueError("缺少 eval_batch_size")
+            except Exception as e:
+                _die(f"eval_profiles {path.relative_to(repo)}: {e}")
+                eval_any_error = True
+        if eval_any_error:
+            failed = True
+
+    # --- rerank ---
+    rrdir = repo / "presets" / "rerank"
+    rrpaths = _glob_yaml(rrdir)
+    rerank_any_error = False
+    for path in rrpaths:
+        try:
+            raw = load_mapping(path)
+            if isinstance(raw, dict) and "num_return_sequences" in raw:
+                raise ValueError("num_return_sequences 已禁止，必须迁移到 presets/eval_profiles/*.yaml")
+        except Exception as e:
+            _die(f"rerank {path.relative_to(repo)}: {e}")
+            rerank_any_error = True
+    if rerank_any_error:
+        failed = True
 
     if failed:
         _die("校验失败（见上文）")

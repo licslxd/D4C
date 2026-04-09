@@ -2,7 +2,7 @@ import os
 import sys
 import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from paths_config import DATA_DIR, MERGED_DATA_DIR
+from paths_config import get_data_dir, get_merged_data_dir
 
 folder_pairs = [
     ("AM_Electronics", "AM_CDs"),
@@ -18,10 +18,10 @@ folder_pairs = [
 columns = ["user", "item", "rating", "review", "explanation", "user_idx", "item_idx"]
 
 def merge_data(source, target, output_folder):
-    source_train = os.path.join(DATA_DIR, source, "train.csv")
-    target_train = os.path.join(DATA_DIR, target, "train.csv")
-    source_valid = os.path.join(DATA_DIR, source, "valid.csv")
-    target_valid = os.path.join(DATA_DIR, target, "valid.csv")
+    source_train = os.path.join(get_data_dir(), source, "train.csv")
+    target_train = os.path.join(get_data_dir(), target, "train.csv")
+    source_valid = os.path.join(get_data_dir(), source, "valid.csv")
+    target_valid = os.path.join(get_data_dir(), target, "valid.csv")
 
     source_train_data = pd.read_csv(source_train)
     target_train_data = pd.read_csv(target_train)
@@ -48,9 +48,9 @@ def merge_data(source, target, output_folder):
     merged_train_data = pd.concat([source_train_data[columns + ["domain"]], target_train_data[columns + ["domain"]]], ignore_index=True)
     merged_valid_data = pd.concat([source_valid_data[columns + ["domain"]], target_valid_data[columns + ["domain"]]], ignore_index=True)
 
-    os.makedirs(os.path.join(MERGED_DATA_DIR, output_folder), exist_ok=True)
-    merged_train_file = os.path.join(MERGED_DATA_DIR, output_folder, "aug_train.csv")
-    merged_valid_file = os.path.join(MERGED_DATA_DIR, output_folder, "aug_valid.csv")
+    os.makedirs(os.path.join(get_merged_data_dir(), output_folder), exist_ok=True)
+    merged_train_file = os.path.join(get_merged_data_dir(), output_folder, "aug_train.csv")
+    merged_valid_file = os.path.join(get_merged_data_dir(), output_folder, "aug_valid.csv")
     merged_train_data.to_csv(merged_train_file, index=False)
     merged_valid_data.to_csv(merged_valid_file, index=False)
 

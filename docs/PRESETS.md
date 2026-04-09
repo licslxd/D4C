@@ -1,114 +1,104 @@
-# D4C 预设（Presets）说明
+# D4C 预设体系（v3 / manifest 4.3）
 
-本文说明 **`python code/d4c.py`** 使用的 YAML 预设如何合并、各自管什么、以及实验时建议先改哪里。  
-实现代码：`code/d4c_core/config_loader.py`（与内置 `code/config.py` 中的旧字典并行存在时，以 **d4c 主线** 为准）。
+配置分为两类：**真正参与 merge 的配置层** 与 **编排层 `eval_profile`**。  
+**CLI 显式传入的非空参数一律最后覆盖** preset 合并结果。`manifest.json`（**schema 4.3**）记录 `consumed_presets`、`config_before_cli`、`training_semantic_fingerprint`（训练主身份）、`generation_semantic_fingerprint`（生成/评测语义，未消费时可为 null）。
 
----
+## `runtime_env`（manifest / `config_resolved.json`）
 
-## 1. 四类预设分别决定什么？
+**唯一**承载 OMP/MKL/TOKENIZERS/CUDA_VISIBLE_DEVICES 等编排层观测，四段结构：
 
-### 1.1 Task preset（`presets/tasks/*.yaml`）
+- **`thread_env_requested`** / **`thread_env_effective`**：解析链得到的请求值与生效值（字符串化标量）。
+- **`launcher_env_requested`** / **`launcher_env_effective`**：如 `CUDA_VISIBLE_DEVICES`（launcher-only，不参与 semantic fingerprint）。
 
-- **决定**：每个 **`--task 1..8`** 对应的 **`auxiliary` / `target` 域名字符串**，以及任务级默认 **`lr`、`coef`、`adv`**（若训练预设未覆盖）。  
-- **合并**：目录下多个 yaml **按文件名排序后合并**；须覆盖任务 1–8。  
-- **适合写进 YAML**：长期稳定的任务定义、默认优化强度。  
-- **更适合 CLI**：一般不通过 CLI 改域对；改任务号用 `--task`。
+`hyperparameters` **不再**重复写入线程或 CUDA 镜像字段；排障请读 `runtime_env` 或 `[startup_runtime_env]` / `[Resolved Outputs]` 中的同口径摘要。
 
-### 1.2 Training preset（`--preset` → `presets/training/<name>.yaml`）
+## 真正参与 merge 的配置层
 
-- **决定**：在某一训练预设 **切片** 下，每个 task 的 **`train_batch_size`、`epochs`**，以及可选的 **`lr` / `coef` / `adv` 覆盖**。  
-- **典型文件**：`step3.yaml`（Step3/4 常用）、`step5.yaml`（Step5 / eval 常用）。  
-- **适合写进 YAML**：正式实验批量、论文复现表。  
-- **更适合 CLI**：临时试跑 `batch_size` / `epochs`（`--batch-size`、`--epochs`）。
+| 层 | 目录 | 职责 |
+|----|------|------|
+| task | `presets/tasks/` | 任务事实：`auxiliary` / `target` / `lr` / `coef` / `adv` |
+| training | `presets/training/` | 训练语义：`train_batch_size`、`epochs`、调度等 |
+| hardware | `presets/hardware/` | `num_proc`、`ddp_world_size`、DataLoader workers、OMP/MKL、`tokenizers_parallelism`、**`cuda_visible_devices`（launcher-only，不进语义 JSON）** 等 |
+| decode | `presets/decode/` | 生成策略（与 `default.yaml` 浅合并） |
+| rerank | `presets/rerank/` | rerank 权重与编排字段（仅 eval-rerank*） |
 
-### 1.3 Runtime preset（`presets/runtime/<name>.yaml`）
+### 新版字段合同（强制）
 
-- **默认文件**：`presets/runtime/default.yaml`。  
-- **切换方式**：环境变量 **`D4C_RUNTIME_PRESET=<stem>`**（无则 `default`；若 `presets/runtime/<stem>.yaml` 不存在则回退 `default.yaml` 逻辑以代码为准）。  
-- **决定**：**`num_proc`**（datasets.map）、**`ddp_world_size`**（默认 2）等 **CPU / DDP 进程数** 相关字段。  
-- **可被 CLI 覆盖**：`--num-proc`、`--ddp-world-size`。  
-- **注意**：`D4C_RUNTIME_PRESET` **会改变主流程行为**（并发与 DDP 规模），应在脚本或文档中写明，避免「换机器忘了 export」。
+- `training` 允许：`train_batch_size`、`per_device_train_batch_size`、`gradient_accumulation_steps`、`epochs`、训练损失/调度/label 长度等；禁止：`eval_batch_size`、`num_return_sequences`、hardware 字段。
+- `hardware` 允许：`ddp_world_size`、`num_proc`、workers/prefetch、`omp_num_threads`、`mkl_num_threads`、`tokenizers_parallelism`、`cuda_visible_devices`（字符串，如 `"0,1"`；由 `d4c.py` 注入子进程 `CUDA_VISIBLE_DEVICES`，**不参与** `D4C_HARDWARE_PROFILE_JSON` 与 training/generation semantic fingerprint）等；禁止：训练/评测 batch 与 `num_return_sequences`。
+- `eval_profile` 允许：`hardware_preset`、`decode_preset`、`rerank_preset`（可选）、`eval_batch_size`、`num_return_sequences`；禁止：`train_batch_size`、`per_device_train_batch_size`、`gradient_accumulation_steps`。
+- `decode` 仅 decode 语义，禁止 batch 字段。
+- `rerank` 仅 rerank 打分语义，禁止 `num_return_sequences` 与 batch 字段。
 
-### 1.4 Decode preset（`presets/decode/*.yaml`）
+## 编排层：`eval_profile`（不是 merge 主链的一层）
 
-- **决定**：**`decode_strategy`、`decode_seed`、`max_explanation_length`、`label_smoothing`、`repetition_penalty`、`generate_temperature`、`generate_top_p`**（进入 `ResolvedConfig`，经 `d4c.py` 传给 Step5 `train`/`eval`）。  
-- **合并**：始终以 **`presets/decode/default.yaml`** 为底，再与 **`--decode-preset <stem>`** 对应的 **`presets/decode/<stem>.yaml`** 做浅层合并（未传则仅 `default`）。  
-- **适合写进 YAML**：固定 greedy / nucleus 温度等实验组（如 `greedy.yaml`、`nucleus_t08_p09.yaml`）。  
-- **CLI（主线）**：**仅** **`--decode-preset <stem>`**。请勿在 `python code/d4c.py …` 后直接使用 **`--decode-strategy` / `--generate-temperature` / `--generate-top-p` / `--decode-seed` / `--repetition-penalty` / `--max-explanation-length`**（这些属于 **torchrun 内的 step5 runner / run-d4c**；误传顶层时会得到明确迁移提示）。  
-- **命名辨析**：manifest / stdout 里 **`decode_preset`** 是所选预设 **文件名 stem**（如 `default`、`greedy`）；**`decode_strategy`**（在 `decode_resolved` 内）是解析后的算法（`greedy` 或 `nucleus`）。因此 **`decode_preset=default` 且 `decode_strategy=greedy` 可同时成立**（默认预设本身就是 greedy 策略）。当前仓库中 **`default` 与 `greedy` 两套 YAML 合并结果等价**，仅 manifest 中的 `decode_preset` 不同。  
-- **高级**：仍可用 **`D4C_RUN_D4C_EXTRA`** 向 step5 子进程追加 **非 decode 主路径** 的 run-d4c 参数（如 `--eval-single-process-safe`）；decode 口径请优先用 `--decode-preset`。
+目录：`presets/eval_profiles/`。**职责**：选择 `hardware_preset` / `decode_preset` /（仅 rerank 命令）`rerank_preset`，并提供 **profile-owned** 字段：
 
-### 1.5 CLI override
+- `eval_batch_size`
+- `num_return_sequences`（**仅** `eval-rerank` / `eval-rerank-matrix`；plain `eval` 若写此键会报错）
 
-- **生效点**：在 **上述链全部合并之后**，仅对 **命令行显式传入且非 None** 的项覆盖：`--batch-size`、`--epochs`、`--num-proc`、`--seed`、`--ddp-world-size`、`--eta`（Step5 反事实权重系数）等。  
-- **不改变**：decode 除 `--decode-preset` 所选文件外，其余字段仍靠 YAML；更细的 run-d4c 开关可走 `D4C_RUN_D4C_EXTRA`（非新手路径）。
+YAML **仅允许**上述引用键与 profile-owned 键；禁止把整段 hardware/decode/rerank 参数块拷进 profile。
 
----
+解析顺序：**先** `resolve_eval_profile`（若提供 `--eval-profile`），**再**按下列顺序加载各 preset YAML 并合并，**最后** CLI 覆盖。
 
-## 2. 合并顺序（一句话）
+## 合并顺序（按命令）
 
-**tasks → training(`--preset`) → runtime(`D4C_RUNTIME_PRESET` 或 default) → decode(default + `--decode-preset`) → CLI**
+- **step3**：`task → training → hardware → CLI`（**不**加载 decode 预设文件）
+- **step4**（**eval 语义侧**，与 eval 共用 eval_batch strict 合同）：**须** `resolve_eval_profile`（CLI **`--eval-profile` 必填**）→ `task → training → hardware → CLI`（**不**加载 decode 预设文件）。  
+  推理全局 batch **仅**来自 `eval_profile.eval_batch_size`（须能被选中 hardware 的 `ddp_world_size` 整除）；**禁止**用 `training.train_batch_size` 作为 step4 推理 batch。
+- **step5（默认，含训练后 valid）**：`task → training → hardware → decode → CLI`  
+  - **`--train-only`**：不加载 decode 预设文件；使用内置占位 decode 标量仅满足训练侧 JSON 注入；**不**写入 `generation_semantic_fingerprint`，`manifest.generation_semantic_resolved` 为 null。
+- **eval / eval-matrix**：`resolve eval_profile?` → `task → training（上下文）→ hardware → decode → profile_owned → CLI`  
+  - 未使用 `--eval-profile` 时，须同时提供 `--hardware-preset` 与 `--decode-preset`。
+- **eval-rerank / eval-rerank-matrix**：在上式之后加载 **rerank**，再 **CLI**。
 
----
+## CLI 要点
 
-## 3. 推荐修改顺序（做实验时）
+- `--preset`：训练 YAML。
+- `--hardware-preset`：`presets/hardware/<stem>.yaml`（子进程经 `D4C_HARDWARE_PROFILE_JSON` 消费）。
+- `--decode-preset`：decode 叠加层（step5 非 train-only 时默认 `decode_greedy_default`）。
+- `--eval-profile`：`presets/eval_profiles/<stem>.yaml`（**step4 必填**；eval 系推荐；**selector**，与 hardware/decode 不同级）。
+- `eval_batch_size` 与 `num_return_sequences` 只允许写在 `eval_profile`，不再提供 public CLI 覆盖入口。
 
-1. **先定任务与阶段**：`--task`、`step3|step4|step5|eval`、`--from-run` / `--step5-run`。  
-2. **再定训练语义**：复制一份 `presets/training/my_exp.yaml`，改 batch/epochs/lr，用 `--preset my_exp`。  
-3. **机器相关**：改 `presets/runtime/*.yaml` 或设 `D4C_RUNTIME_PRESET`，最后再用 CLI 微调 `--ddp-world-size` / `--num-proc`。  
-4. **解码/指标口径**：改 `presets/decode/default.yaml`（团队内注意同步版本）。  
-5. **临时一次性试跑**：优先 **CLI** 覆盖 batch/epochs/seed，避免污染共享 YAML。
+## Step5 主线默认（减法重构）
 
-**不建议**：在未理解路径约定前改 `code/executors/*_engine.py` 内硬编码；路径与 checkpoint 规则以 **`docs/D4C_Scripts_and_Runtime_Guide.md`** 为准。
+- `presets/training/step5.yaml` 主线默认 `train_label_max_length=64`。
+- 训练标签 padding 主线为 `train_dynamic_padding=true`（batch 内动态补齐），不再走固定 128 长度全局 pad。
+- `loss_weight_repeat_ul` / `loss_weight_terminal_clean` / `terminal_clean_span` 仅允许在 **training preset** 配置；`decode preset` 不再注入训练损失。
+- rerank 仅定位为 `eval-rerank*` 可选增强路径，非 train/eval 主线必经。
+- manifest / config_resolved / train log 会显式记录 `train_label_max_length`、dynamic padding 策略和训练辅助损失权重；运行环境仅见 **`runtime_env`**（见上文）。
 
----
+## 指纹与实验身份
 
-## 4. 示例
+- **`training_semantic_fingerprint`**：训练主实验身份（`training_payload` 不含 `eval_batch_size` + `hardware_profile` 语义切片 + DDP + `train_label_max_length`）；**不含** decode、rerank、eval_profile 名；**不含** `omp_num_threads` / `mkl_num_threads` / `tokenizers_parallelism` / `cuda_visible_devices` / `runtime_env`（上述属编排层 launcher env，见 manifest `runtime_env`）。
+- **`generation_semantic_fingerprint`**：生成/评测侧（decode 摘要、eval batch、rerank 摘要、`num_return_sequences` 等）。step3 为空；**step4** 含 **`eval_batch_size`**（来自 eval_profile）；step5 `--train-only` 为空。
 
-### 示例 A：用 **task 4** 跑 Step3（training 用 `step3`）
+同一 Step5 训练可换不同 decode 再跑 `eval`，**训练指纹不变、生成指纹变**。
+
+## 官方 stem 速查
+
+**hardware**：`default`、`hw_1gpu_fast`、`hw_1gpu_throughput`、`hw_2gpu_balanced`、`hw_2gpu_quality`、`hw_debug_smoke`
+
+**decode**：`decode_greedy_default`、`decode_balanced_v2`、`decode_diverse_v2`、`decode_conservative_v2`、`decode_rerank_quality_v2`
+
+**rerank**：`rerank_v3_default`、`rerank_v3_quality_first`、`rerank_v3_softclean`（及 `default.yaml` 底）
+
+**eval_profile**：`eval_fast_single_gpu`、`eval_balanced_2gpu`、`eval_rerank_quality`、`eval_rerank_probe`
+
+## 子进程与单一真相源
+
+- 训练语义：`D4C_EFFECTIVE_TRAINING_PAYLOAD_JSON`（`schema_version: 2`，含 `auxiliary` / `target`）。
+- 硬件：`D4C_HARDWARE_PROFILE_JSON` + `D4C_HARDWARE_PRESET`（hardware stem）。
+- 指纹：`D4C_TRAINING_SEMANTIC_FINGERPRINT`、`D4C_GENERATION_SEMANTIC_FINGERPRINT`（有则注入）、`D4C_RUNTIME_DIAGNOSTICS_FINGERPRINT`。
+- 评测编排名：`D4C_EVAL_PROFILE_NAME`（**step4** / eval* 使用 `--eval-profile` 时）；step4 另注入 `D4C_GLOBAL_EVAL_BATCH_SIZE`、`D4C_EVAL_PER_GPU_BATCH_SIZE`（与 manifest 中 `global_eval_batch_size` / `eval_per_gpu_batch_size` 一致）。
+- 子进程 **不**依赖父 shell 的 `D4C_HARDWARE_PRESET` 去重新选 YAML；须由 `d4c.py` 注入 JSON。
+
+## 矩阵运行追踪
+
+`eval-matrix` / `eval-rerank-matrix` 在子 run 的 manifest 中写入 `matrix_session_id`、`matrix_cell_id`、`invoked_command`（如 `eval-matrix`）与 `cell_command`（如 `eval`）。`eval_profile_detail.orchestrator_yaml` 记录 selector 声明（若使用 profile）。
+
+## 校验
 
 ```bash
-python code/d4c.py step3 --task 4 --preset step3
+python scripts/check_presets.py
 ```
-
-- **task 4** 的 auxiliary/target 来自 **`presets/tasks/*.yaml`** 中键 `4`。  
-- **batch/epochs** 来自 **`presets/training/step3.yaml`** 中 task `4` 段。  
-- **num_proc / ddp_world_size** 来自 **runtime**（及可选 CLI）。
-
-### 示例 B：Step5 训练（**training preset 用 `step5`**）
-
-```bash
-python code/d4c.py step5 --task 4 --preset step5 \
-  --from-run step3_opt_20260329_1200 --step5-run step5_opt_20260329_1400
-```
-
-- **训练超参** 以 **`presets/training/step5.yaml`** 中 task 4 为主。  
-- **`--eta`** 默认链上来自 adv，可在 CLI 显式覆盖。
-
-### 示例 C：Eval / 解码相关标量
-
-Eval 同样走 **`ResolvedConfig`**；decode 由 **`default.yaml` + `--decode-preset`** 合并后写入 manifest 的 **`decode_resolved`**，并传给 Step5 eval。
-
-```bash
-python code/d4c.py eval --task 4 --preset step5 \
-  --from-run step3_opt_20260329_1200 --step5-run step5_opt_20260329_1400 \
-  --decode-preset nucleus_t08_p09
-```
-
-若需其它 run-d4c 独占参数（且不宜用 YAML 表达），可查阅主指南 **高级** `D4C_RUN_D4C_EXTRA`；decode 相关请优先增加或选用 `presets/decode/*.yaml` + `--decode-preset`。
-
----
-
-## 5. 与 manifest 的关系
-
-每次主线运行（默认）在 **`log_dir/d4c_run_manifest.json`** 中记录 **`training_preset`、`runtime_preset`、`decode_preset`**、域对、路径与关键超参，用于对照「我以为的预设」与「实际解析结果」。详见 **README** 与 **`docs/D4C_Scripts_and_Runtime_Guide.md`** §1.3.1。
-
----
-
-## 6. 相关文档
-
-| 文档 | 内容 |
-|------|------|
-| `README.md` | 快速上手、产物路径、排障入口 |
-| `docs/D4C_Scripts_and_Runtime_Guide.md` | Shell、路径、`DDP_NPROC`、高级环境变量附录 |
-| `D4C_离线完整指南.md` | 离线数据、集群与补充命令 |

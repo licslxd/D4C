@@ -7,20 +7,21 @@ import sys
 
 from executors import bootstrap
 from executors import ddp_utils
+from executors.startup_config_check import print_startup_config_check
 
 _STEP3_RUNNER = "step3 runner（torchrun 内部入口）"
 
 
 def print_step3_root_help() -> None:
-    """仅标准库 + argparse，用于薄壳根 ``--help`` 快路径。"""
+    """仅标准库 + argparse，用于 ``step3_entry.py --help`` 快路径。"""
     epilog = (
         "用户日常（仓库根）: python code/d4c.py step3 …\n"
-        "子命令完整参数: 在 code/ 下对薄壳执行 train --help / eval --help（将加载完整依赖）。"
+        "子命令完整参数: 在 code/ 下执行 executors/step3_entry.py train --help / eval --help。"
     )
     p = argparse.ArgumentParser(
         prog="step3-runner",
         description=(
-            "Step3 域对抗 — torchrun 内部入口（历史兼容薄壳文件名见仓库 code/）。"
+            "Step3 域对抗 — torchrun 内部入口（executors/step3_entry.py）。"
             "请优先: python code/d4c.py step3 …"
         ),
         epilog=epilog,
@@ -66,6 +67,7 @@ def run_step3_cli() -> None:
     eval_p = sub.add_parser("eval", help="DDP 评测（内部可由 sh 或高级场景调用）")
     _add_eval_args(eval_p)
     args = parser.parse_args()
+    print_startup_config_check(stage="step3", command=str(args.command))
     if args.command == "train":
         ddp_utils.exit_if_not_torchrun(
             executor_label=_STEP3_RUNNER,
@@ -89,3 +91,7 @@ def run_step3_cli() -> None:
         _dispatch_eval(args)
     else:
         raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    run_step3_cli()

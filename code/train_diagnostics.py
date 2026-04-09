@@ -19,8 +19,33 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from train_logging import ROUTE_DETAIL, ROUTE_SUMMARY, log_route_extra
+from d4c_core.training_diagnostics import d4c_grad_topk, parse_d4c_finite_check_mode
 
 _LOGGER = logging.getLogger("d4c")
+
+
+def d4c_cuda_bf16_autocast_enabled() -> bool:
+    """
+    CUDA 且 ``torch.cuda.is_bf16_supported()`` 为真时默认启用 bf16 混合精度前向。
+    显式关闭：环境变量 ``D4C_BF16=0``（或 ``false`` / ``off``）。
+    """
+    v = os.environ.get("D4C_BF16", "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if not torch.cuda.is_available():
+        return False
+    return bool(torch.cuda.is_bf16_supported())
+
+
+@contextmanager
+def d4c_cuda_bf16_autocast():
+    """训练 / 验证 / 推理前向的统一 bf16 autocast（不支持或已关闭时等价于禁用）。"""
+    with torch.autocast(
+        device_type="cuda",
+        dtype=torch.bfloat16,
+        enabled=d4c_cuda_bf16_autocast_enabled(),
+    ):
+        yield
 
 
 def _env_int(name: str, default: int) -> int:
@@ -47,13 +72,6 @@ def d4c_grad_warn_norm() -> float:
         return float(os.environ.get("D4C_GRAD_WARN_NORM", "100"))
     except ValueError:
         return 100.0
-
-
-def d4c_grad_topk() -> int:
-    try:
-        return max(0, int(os.environ.get("D4C_GRAD_TOPK", "3")))
-    except ValueError:
-        return 3
 
 
 def d4c_debug_grad_diff() -> bool:
@@ -134,15 +152,27 @@ def grad_norm_total(parameters: Iterable[torch.nn.Parameter]) -> float:
 
 
 def grad_topk_param_norms(model: nn.Module, k: int) -> List[Tuple[str, float]]:
+    """
+    在设备上计算各参数 grad L2 norm，用 ``torch.topk`` 取前 k 个，最后只对 top-k 做少量 CPU 同步。
+    避免「每个参数一次 .item()」带来的同步风暴。
+    """
     if k <= 0:
         return []
-    scored: List[Tuple[str, float]] = []
+    names: List[str] = []
+    norms: List[torch.Tensor] = []
     for name, p in model.named_parameters():
-        if p.grad is None:
+        if p.grad is None or p.grad.is_sparse:
             continue
-        scored.append((name, float(p.grad.detach().data.norm(2).item())))
-    scored.sort(key=lambda x: -x[1])
-    return scored[:k]
+        names.append(name)
+        norms.append(torch.norm(p.grad.detach(), 2))
+    if not norms:
+        return []
+    stacked = torch.stack(norms)
+    kk = min(k, int(stacked.numel()))
+    vals, indices = torch.topk(stacked, kk)
+    idx_list = indices.detach().cpu().tolist()
+    val_list = vals.detach().cpu().tolist()
+    return [(names[int(i)], float(v)) for i, v in zip(idx_list, val_list)]
 
 
 def log_grad_monitor(
@@ -196,7 +226,7 @@ def d4c_save_checkpoint(
         raise RuntimeError(f"[Checkpoint] save failed: file missing after torch.save: {p}")
     sz = os.path.getsize(p)
     if metadata is not None:
-        meta_path = os.path.splitext(p)[0] + ".checkpoint_meta.json"
+        meta_path = os.path.splitext(p)[0] + ".meta.json"
         try:
             payload: Dict[str, Any] = {
                 "epoch": int(epoch),
@@ -293,6 +323,31 @@ def maybe_log_grad_norm_diff_ddp(
                 diff,
                 global_step,
             )
+
+
+def run_training_finite_checks(
+    mode: str,
+    loss: torch.Tensor,
+    word_dist: torch.Tensor,
+    logger: Optional[logging.Logger],
+    *,
+    global_step: int,
+    epoch: int,
+    route_detail: str = ROUTE_DETAIL,
+) -> None:
+    """按模式执行步级 finite 检查；主线默认 ``loss_only``（不扫整图 word_dist）。"""
+    if mode == "off":
+        return
+    check_finite_loss(loss, logger, global_step=global_step, epoch=epoch, route_detail=route_detail)
+    if mode == "full_word_dist":
+        check_finite_tensor(
+            word_dist,
+            logger,
+            name="word_dist",
+            global_step=global_step,
+            epoch=epoch,
+            route_detail=route_detail,
+        )
 
 
 def check_finite_loss(

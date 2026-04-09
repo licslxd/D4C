@@ -1,9 +1,0 @@
-# 与 RUNTIME_PRESETS["gpu01_ddp2_12c"] 一致
-max_parallel_cpu: 10
-num_proc: 4
-dataloader_workers_train_per_rank_cap: 3
-dataloader_num_workers_valid: 2
-dataloader_num_workers_test: 2
-dataloader_prefetch_factor_train: 2
-dataloader_prefetch_factor_valid: 2
-dataloader_prefetch_factor_test: 2

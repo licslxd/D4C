@@ -3,12 +3,13 @@
 INTERNAL EXECUTOR — Step3 域对抗模型与训练循环（非用户首选入口）。
 
 - MAINLINE ENTRY：``python code/d4c.py step3|eval|…``（仓库根目录）。
-- 本文件由 ``d4c.py`` / ``sh/*.sh`` 经 torchrun 分发给 **step3 runner** 调用；勿作为日常手工入口。
+- 本文件由 ``d4c.py`` 经 torchrun 分发给 **step3 runner** 调用；勿作为日常手工入口。
 - Step4 引擎 ``executors.step4_engine`` 自本模块 ``import *`` 复用符号。
 """
 import os
 import sys
 import copy
+import json
 import time
 import hashlib
 import warnings
@@ -33,7 +34,8 @@ warnings.filterwarnings("ignore", message=".*torch.cuda.amp.autocast.*deprecated
 warnings.filterwarnings("ignore", message=".*Attempting to run cuBLAS.*no current CUDA context.*", category=UserWarning)
 
 from base_utils import *
-from paths_config import T5_SMALL_DIR, DATA_DIR, MERGED_DATA_DIR, get_checkpoint_task_dir
+from paths_config import get_data_dir, get_hf_cache_root, get_merged_data_dir, get_stage_run_dir, get_t5_small_dir
+from d4c_core.runtime_env_pack import runtime_env_dict_for_config_resolved
 import torch
 
 # transformers 在 modeling_utils.load_state_dict 里用 torch.load(..., map_location=...) 未传 weights_only，
@@ -72,7 +74,11 @@ from datasets import Dataset, DatasetDict, load_from_disk
 from config import (
     FinalTrainingConfig,
     apply_ddp_fast_torch_backends,
+    build_full_bleu_monitor_cfg_override,
     build_resolved_training_config,
+    format_full_bleu_eval_epoch_decision_log_line,
+    format_full_bleu_eval_resolved_log_line,
+    format_full_bleu_monitor_log_line,
     get_eval_batch_size,
     get_dataloader_num_workers,
     get_dataloader_prefetch_factor,
@@ -81,9 +87,12 @@ from config import (
     resolve_task_idx_from_aux_target,
     should_run_full_bleu_eval_epoch,
 )
-from training_runtime_inputs import collect_training_runtime_overrides_from_args
+from training_hardware_inputs import collect_training_hardware_overrides_from_args
+from d4c_core.training_diagnostics import training_diagnostics_snapshot
 from lr_schedule_utils import resolve_warmup_steps, warmup_cosine_multiplier_lambda
 from bleu_valid_ddp import bleu4_explanation_full_valid_ddp
+from d4c_core.bleu_runtime import explanation_bleu4_quick_score
+from d4c_core.gather_schema import GatheredBatch, require_gathered_batch
 from train_logging import (
     create_run_paths,
     setup_train_logging,
@@ -104,19 +113,23 @@ from train_logging import (
     ROUTE_SUMMARY,
 )
 from train_diagnostics import (
-    check_finite_loss,
-    check_finite_tensor,
     collect_distributed_env_for_meta,
+    d4c_cuda_bf16_autocast,
+    d4c_cuda_bf16_autocast_enabled,
+    d4c_grad_topk,
     d4c_log_grad_interval,
     d4c_log_step_interval,
     d4c_log_step_loss_parts,
     d4c_save_checkpoint,
     d4c_timing_phase,
     ddp_heartbeat,
+    log_bf16_amp_note,
     log_grad_monitor,
     log_step_sample,
     log_training_crash,
     maybe_log_grad_norm_diff_ddp,
+    parse_d4c_finite_check_mode,
+    run_training_finite_checks,
     warn_empty_batch,
 )
 
@@ -128,11 +141,12 @@ _EVAL_REQUIRES_TORCHRUN_MSG = (
     "多卡请设置 CUDA_VISIBLE_DEVICES 并使 nproc_per_node 与可见 GPU 数一致。"
 )
 
-_t5_path = T5_SMALL_DIR if os.path.exists(T5_SMALL_DIR) else "t5-small"
+_t5_base = get_t5_small_dir()
+_t5_path = _t5_base if os.path.exists(_t5_base) else "t5-small"
 tokenizer = T5Tokenizer.from_pretrained(_t5_path, legacy=True)
 
 # HuggingFace tokenize 磁盘缓存：修改 Processor/tokenize 语义或需强制失效时与 step5 引擎同步递增
-D4C_TOKENIZE_CACHE_VERSION = "v2"
+D4C_TOKENIZE_CACHE_VERSION = "v4"
 
 tasks = [
     ("AM_Electronics", "AM_CDs"),
@@ -249,7 +263,15 @@ class Processor():
             raise ValueError("Unknown domain!")
 
         domain_idx = torch.tensor(domain_val, dtype=torch.long)
-        return {"user_idx": user_idx, "item_idx": item_idx, "rating": raitng, "explanation_idx": explanation_idx, "domain_idx": domain_idx}
+        sample_id = torch.tensor(int(sample["sample_id"]), dtype=torch.long)
+        return {
+            "user_idx": user_idx,
+            "item_idx": item_idx,
+            "rating": raitng,
+            "explanation_idx": explanation_idx,
+            "domain_idx": domain_idx,
+            "sample_id": sample_id,
+        }
 
 
 class PETER_MLP(nn.Module):
@@ -288,6 +310,7 @@ class Model(nn.Module):
         self.transformer_encoder = CustomTransformerEncoder(encoder_layers, nlayers)
         self.pos_encoder = PositionalEncoding(emsize, dropout)
         self.emsize = emsize
+        self.ntoken = int(ntoken)
         self.rating_loss_fn = nn.MSELoss()
         self.exp_loss_fn = nn.CrossEntropyLoss(ignore_index=0)
         self.init_weights()
@@ -322,15 +345,25 @@ class Model(nn.Module):
         return rating, context_dist, word_dist, user_hidden, item_hidden
 
     def gather(self, batch, device):
-        user_idx, item_idx, rating, tgt_output, domain_idx = batch
+        user_idx, item_idx, rating, tgt_output, domain_idx, sample_id = batch
         # 配合 DataLoader(pin_memory=True) 使用 non_blocking=True，减少同步拷贝等待
         user_idx = user_idx.to(device, non_blocking=True)
         item_idx = item_idx.to(device, non_blocking=True)
         domain_idx = domain_idx.to(device, non_blocking=True)
         rating = rating.to(device, non_blocking=True).float()
         tgt_output = tgt_output.to(device, non_blocking=True)
+        sample_id = sample_id.to(device, non_blocking=True)
         tgt_input = T5_shift_right(tgt_output)
-        return user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx
+        return GatheredBatch(
+            user_idx=user_idx,
+            item_idx=item_idx,
+            rating=rating,
+            tgt_input=tgt_input,
+            tgt_output=tgt_output,
+            domain_idx=domain_idx,
+            sample_id=sample_id,
+            exp_sample_weight=None,
+        )
 
     def recommend(self, user, item, domain):
         domain_embedding = self.domain_profiles[domain].unsqueeze(dim=1)
@@ -379,8 +412,17 @@ def validModel(model, valid_dataloader, device):
     with torch.no_grad():
         avg_loss = 0
         for batch in valid_dataloader:
-            user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = _model.gather(batch, device)
-            pred_rating, _, word_dist, _, _, = model(user_idx, item_idx, tgt_input, domain_idx)
+            g = require_gathered_batch(_model.gather(batch, device))
+            user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = (
+                g.user_idx,
+                g.item_idx,
+                g.rating,
+                g.tgt_input,
+                g.tgt_output,
+                g.domain_idx,
+            )
+            with d4c_cuda_bf16_autocast():
+                pred_rating, _, word_dist, _, _, = model(user_idx, item_idx, tgt_input, domain_idx)
             loss_r = _model.rating_loss_fn(pred_rating, rating)
             loss_e = _model.exp_loss_fn(word_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
             loss = loss_r + loss_e
@@ -394,6 +436,8 @@ def validModel_sum_batches(model, valid_dataloader, device):
     DDP 训练时用于验证聚合（与 train loss、Step5 valid 一致：样本加权）：
     - 返回 (loss_sum, n_samples)，其中 loss_sum = Σ (batch 标量 loss × batch 内样本数)。
     - 外层对两维做 all_reduce(SUM) 后，current_valid_loss = 全局 loss_sum / 全局 n_samples。
+    - 验证集在各 rank 上为无重叠划分（见 build_config_and_data_ddp 中 Subset + 索引），
+      避免 DistributedSampler 补重复样本导致全局均值偏差。
     """
     _model = get_underlying_model(model)
     model.eval()
@@ -401,9 +445,18 @@ def validModel_sum_batches(model, valid_dataloader, device):
         loss_sum = 0.0
         n_samples = 0
         for batch in valid_dataloader:
-            user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = _model.gather(batch, device)
+            g = require_gathered_batch(_model.gather(batch, device))
+            user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = (
+                g.user_idx,
+                g.item_idx,
+                g.rating,
+                g.tgt_input,
+                g.tgt_output,
+                g.domain_idx,
+            )
             bsz = int(user_idx.size(0))
-            pred_rating, _, word_dist, _, _, = model(user_idx, item_idx, tgt_input, domain_idx)
+            with d4c_cuda_bf16_autocast():
+                pred_rating, _, word_dist, _, _, = model(user_idx, item_idx, tgt_input, domain_idx)
             loss_r = _model.rating_loss_fn(pred_rating, rating)
             loss_e = _model.exp_loss_fn(word_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
             loss = loss_r + loss_e
@@ -491,7 +544,7 @@ def _build_step3_cache_dir(
         max_length=int(getattr(processor, "max_length", 25)),
         cache_version=cache_version,
     )
-    cache_dir = os.path.join(get_checkpoint_task_dir(task_idx), f"hf_cache_step3_{fp}")
+    cache_dir = os.path.join(get_hf_cache_root(task_idx), f"hf_cache_step3_{fp}")
     return cache_dir, fp
 
 
@@ -532,7 +585,7 @@ def _build_step3_eval_cache_dir(
         max_length=int(getattr(processor, "max_length", 25)),
         cache_version=cache_version,
     )
-    cache_dir = os.path.join(get_checkpoint_task_dir(task_idx), f"hf_cache_step3_eval_{fp}")
+    cache_dir = os.path.join(get_hf_cache_root(task_idx), f"hf_cache_step3_eval_{fp}")
     return cache_dir, fp
 
 
@@ -608,20 +661,25 @@ def _load_advtrain_artefacts(
     show_datasets_progress: bool = True,
 ):
     task_idx = int(resolved.task_idx)
-    path = os.path.join(MERGED_DATA_DIR, str(task_idx))
+    path = os.path.join(get_merged_data_dir(), str(task_idx))
     train_path = os.path.join(path, "aug_train.csv")
     valid_path = os.path.join(path, "aug_valid.csv")
     train_df = pd.read_csv(train_path)
     nuser = int(train_df["user_idx"].max()) + 1
     nitem = int(train_df["item_idx"].max()) + 1
 
-    os.makedirs(get_checkpoint_task_dir(task_idx), exist_ok=True)
+    os.makedirs(get_stage_run_dir(task_idx), exist_ok=True)
     nproc = int(resolved.num_proc)
-    save_file = args.save_file or os.path.join(get_checkpoint_task_dir(task_idx), "model.pth")
+    save_file = args.save_file or os.path.join(get_stage_run_dir(task_idx), "model", "model.pth")
 
     valid_df = pd.read_csv(valid_path)
     train_df["item"] = train_df["item"].astype(str)
     valid_df["item"] = valid_df["item"].astype(str)
+    # 与 step5 一致：仅保留有 explanation 的训练行（nuser/nitem 已在上方用过滤前 train_df 计算）
+    train_df = train_df[train_df["explanation"].notna()].reset_index(drop=True)
+    valid_df = valid_df.reset_index(drop=True)
+    train_df["sample_id"] = np.arange(len(train_df), dtype=np.int64)
+    valid_df["sample_id"] = np.arange(len(valid_df), dtype=np.int64)
     datasets = DatasetDict({
         "train": Dataset.from_pandas(train_df),
         "valid": Dataset.from_pandas(valid_df),
@@ -658,36 +716,36 @@ def _load_advtrain_artefacts(
     train_dataset = TensorDataset(
         encoded_data["train"]["user_idx"], encoded_data["train"]["item_idx"],
         encoded_data["train"]["rating"], encoded_data["train"]["explanation_idx"],
-        encoded_data["train"]["domain_idx"],
+        encoded_data["train"]["domain_idx"], encoded_data["train"]["sample_id"],
     )
     valid_dataset = TensorDataset(
         encoded_data["valid"]["user_idx"], encoded_data["valid"]["item_idx"],
         encoded_data["valid"]["rating"], encoded_data["valid"]["explanation_idx"],
-        encoded_data["valid"]["domain_idx"],
+        encoded_data["valid"]["domain_idx"], encoded_data["valid"]["sample_id"],
     )
 
     suser_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, args.auxiliary, "user_profiles.npy")),
+        np.load(os.path.join(get_data_dir(), args.auxiliary, "user_profiles.npy")),
         dtype=torch.float, device=device,
     )
     sitem_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, args.auxiliary, "item_profiles.npy")),
+        np.load(os.path.join(get_data_dir(), args.auxiliary, "item_profiles.npy")),
         dtype=torch.float, device=device,
     )
     sdomain_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, args.auxiliary, "domain.npy")),
+        np.load(os.path.join(get_data_dir(), args.auxiliary, "domain.npy")),
         dtype=torch.float, device=device,
     )
     tuser_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, args.target, "user_profiles.npy")),
+        np.load(os.path.join(get_data_dir(), args.target, "user_profiles.npy")),
         dtype=torch.float, device=device,
     )
     titem_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, args.target, "item_profiles.npy")),
+        np.load(os.path.join(get_data_dir(), args.target, "item_profiles.npy")),
         dtype=torch.float, device=device,
     )
     tdomain_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, args.target, "domain.npy")),
+        np.load(os.path.join(get_data_dir(), args.target, "domain.npy")),
         dtype=torch.float, device=device,
     )
 
@@ -698,7 +756,7 @@ def _load_advtrain_artefacts(
     model = Model(
         nuser,
         nitem,
-        resolved.ntoken,
+        int(len(tokenizer)),
         resolved.emsize,
         resolved.nhead,
         resolved.nhid,
@@ -712,16 +770,34 @@ def _load_advtrain_artefacts(
     return train_dataset, valid_dataset, model, discriminator, nuser, nitem, save_file
 
 
+def _distributed_valid_sample_indices(n_valid: int, world_size: int, rank: int) -> list[int]:
+    """
+    验证集按样本无重叠划分到各 rank（不补重复样本）。
+    与 DistributedSampler(drop_last=False) 不同：后者为对齐 total_size 会复制索引，导致
+    valid loss 的 all_reduce 加权平均偏离「全验证集各样本恰好一次」的真实均值。
+    分片为连续区间，与 bleu4_explanation_full_valid_ddp 的按 rank 切块一致（仅按余数平衡各卡条数）。
+    """
+    if n_valid <= 0:
+        return []
+    if world_size <= 1:
+        return list(range(n_valid))
+    base = n_valid // world_size
+    rem = n_valid % world_size
+    start = rank * base + min(rank, rem)
+    size = base + (1 if rank < rem else 0)
+    return list(range(start, start + size))
+
+
 def build_config_and_data_ddp(args, rank: int, world_size: int, local_rank: int) -> tuple:
     _tid = resolve_task_idx_from_aux_target(args.auxiliary, args.target)
     if _tid is None:
         raise ValueError("未知的 auxiliary/target 组合")
-    _ro = collect_training_runtime_overrides_from_args(args)
+    _ro = collect_training_hardware_overrides_from_args(args)
     resolved = build_resolved_training_config(
         args,
         task_idx=_tid,
         world_size=world_size,
-        runtime_overrides=_ro,
+        hardware_overrides=_ro,
     )
     G = int(resolved.train_batch_size)
     P = int(resolved.per_device_train_batch_size)
@@ -764,18 +840,22 @@ def build_config_and_data_ddp(args, rank: int, world_size: int, local_rank: int)
             f"train DataLoader 每 epoch 批次数为 {n_train_micro}，无法被 gradient_accumulation_steps={A} 整除。"
             f"请调整全局 batch、--per-device-batch-size、world_size 或数据划分；或令 accum=1。"
         )
-    valid_per_rank = max(1, G // world_size)
-    valid_sampler = DistributedSampler(
-        valid_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=False,
-        drop_last=False,
-    )
+    if G % world_size != 0:
+        raise ValueError(
+            f"train_batch_size={G} 与 world_size={world_size} 不整除，无法得到每卡 batch。"
+            "请修改 training preset（train_batch_size / per_device_train_batch_size / gradient_accumulation_steps）或 hardware preset（ddp_world_size）。"
+        )
+    valid_per_rank = G // world_size
+    n_valid = len(valid_dataset)
+    if world_size > 1:
+        _v_idx = _distributed_valid_sample_indices(n_valid, world_size, rank)
+        # 即使某 rank 分片为空也必须用 Subset(..., [])，不能用「if _v_idx」回退全量（[] 在 Python 中为假值）
+        valid_shard: TensorDataset | Subset = Subset(valid_dataset, _v_idx)
+    else:
+        valid_shard = valid_dataset
     valid_dataloader = DataLoader(
-        valid_dataset,
+        valid_shard,
         batch_size=valid_per_rank,
-        sampler=valid_sampler,
         shuffle=False,
         num_workers=nw_valid,
         pin_memory=pin_memory,
@@ -783,7 +863,7 @@ def build_config_and_data_ddp(args, rank: int, world_size: int, local_rank: int)
         prefetch_factor=resolved.dataloader_prefetch_factor_valid,
     )
 
-    _ddp_find_unused = bool(getattr(args, "ddp_find_unused_parameters", True))
+    _ddp_find_unused = bool(resolved.ddp_find_unused_parameters)
     model = nn.parallel.DistributedDataParallel(
         model,
         device_ids=[local_rank],
@@ -821,46 +901,6 @@ def _ddp_no_sync_both(model, discriminator, world_size: int, sync_gradients: boo
     else:
         with model.no_sync(), discriminator.no_sync():
             yield
-
-
-def _valid_bleu4_quick(
-    model,
-    valid_dataset,
-    device,
-    max_samples: int,
-    *,
-    dataloader_num_workers: int,
-    dataloader_prefetch_factor: Optional[int],
-) -> float:
-    """在验证集前 max_samples 条上算 BLEU-4（与 evaluate_text 词级 BLEU 一致），仅 rank0 调用。"""
-    _m = get_underlying_model(model)
-    n = min(len(valid_dataset), max_samples)
-    if n <= 0:
-        return 0.0
-    subset = Subset(valid_dataset, list(range(n)))
-    bs = min(32, n)
-    _vn = max(0, int(dataloader_num_workers))
-    _pf = dataloader_prefetch_factor if _vn > 0 else None
-    dl = DataLoader(
-        subset,
-        batch_size=bs,
-        shuffle=False,
-        num_workers=_vn,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=_vn > 0,
-        prefetch_factor=_pf,
-    )
-    pred_texts = []
-    ref_texts = []
-    _m.eval()
-    with torch.inference_mode():
-        for batch in dl:
-            user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = _m.gather(batch, device)
-            gen_ids, _ = _m.generate(user_idx, item_idx, domain_idx)
-            pred_texts.extend(tokenizer.batch_decode(gen_ids, skip_special_tokens=True))
-            ref_texts.extend(tokenizer.batch_decode(tgt_output, skip_special_tokens=True))
-    scores = compute_bleu1234_only(pred_texts, ref_texts)
-    return float(scores.get("4", 0.0))
 
 
 def _effective_adversarial_coef_epoch(
@@ -910,6 +950,7 @@ def trainModel_ddp(
     adv_coef_target = float(final_cfg.adversarial_coef_target)
     _model = get_underlying_model(model)
     device = final_cfg.device
+    use_bf16 = d4c_cuda_bf16_autocast_enabled()
     n_micro = len(train_dataloader)
     n_steps = max(1, n_micro // A)
     train_info = (
@@ -928,8 +969,8 @@ def trainModel_ddp(
     valid_dataset_for_bleu = final_cfg.valid_dataset
     lr_scheduler_type = str(final_cfg.lr_scheduler)
     warmup_epochs = float(final_cfg.warmup_epochs)
-    full_eval_every = int(final_cfg.full_eval_every_epochs)
-    full_eval_phased = final_cfg.full_eval_phased
+    fe_sched = final_cfg.full_bleu_eval_resolved
+    full_bleu_monitor_cfg_override = build_full_bleu_monitor_cfg_override(final_cfg)
     dual_bleu = bool(final_cfg.dual_bleu_eval)
     min_lr_ratio = float(final_cfg.min_lr_ratio)
     warmup_steps_env = final_cfg.d4c_warmup_steps
@@ -946,17 +987,35 @@ def trainModel_ddp(
             _lg.info(train_info, extra=log_route_extra(_lg, ROUTE_SUMMARY))
         else:
             print(train_info, flush=True)
-        _sched = (
-            f"phased{full_eval_phased}"
-            if full_eval_phased is not None
-            else f"uniform_interval={full_eval_every}"
-        )
+        if use_bf16:
+            _bf16_msg = "[Train] bf16 autocast: ON (default, CUDA bf16 supported; set D4C_BF16=0 to disable)"
+        elif os.environ.get("D4C_BF16", "").strip().lower() in ("0", "false", "no", "off"):
+            _bf16_msg = "[Train] bf16 autocast: OFF (D4C_BF16 disables bf16)"
+        elif not torch.cuda.is_available():
+            _bf16_msg = "[Train] bf16 autocast: OFF (CUDA not available)"
+        else:
+            _bf16_msg = "[Train] bf16 autocast: OFF (torch.cuda.is_bf16_supported() is False)"
+        if _lg:
+            _lg.info(_bf16_msg, extra=log_route_extra(_lg, ROUTE_SUMMARY))
+        else:
+            print(_bf16_msg, flush=True)
+        log_bf16_amp_note(_lg, use_bf16, has_grad_scaler=False)
+        _fbe_line = format_full_bleu_eval_resolved_log_line(fe_sched)
+        if _lg:
+            _lg.info(_fbe_line, extra=log_route_extra(_lg, ROUTE_SUMMARY))
+        else:
+            print(_fbe_line, flush=True)
+        _fb_mon_line = format_full_bleu_monitor_log_line(final_cfg)
+        if _lg:
+            _lg.info(_fb_mon_line, extra=log_route_extra(_lg, ROUTE_SUMMARY))
+        else:
+            print(_fb_mon_line, flush=True)
         _es = (
             f"Early stop: min_epochs={min_epochs}, patience={early_stop_patience} (非 dual_bleu 时 valid 变差), "
             f"early_stop_patience_full={early_stop_patience_full} (dual_bleu: full BLEU 未刷新 best), "
             f"early_stop_patience_loss={early_stop_patience_loss} (dual_bleu: valid_loss 连续变差), "
             f"checkpoint_metric={checkpoint_metric}, quick_eval_max_samples={quick_eval_max_samples}, "
-            f"full_bleu_schedule={_sched}, dual_bleu_eval={dual_bleu}"
+            f"dual_bleu_eval={dual_bleu}"
         )
         if _lg:
             _lg.info(_es, extra=log_route_extra(_lg, ROUTE_SUMMARY))
@@ -964,10 +1023,10 @@ def trainModel_ddp(
             print(_es, flush=True)
         if _lg:
             _lg.info(
-                "Train profile: lr_scheduler=%s warmup_epochs=%g full_bleu_schedule=%s",
+                "Train profile: lr_scheduler=%s warmup_epochs=%g %s",
                 lr_scheduler_type,
                 warmup_epochs,
-                _sched,
+                _fbe_line,
                 extra=log_route_extra(_lg, ROUTE_SUMMARY),
             )
 
@@ -1040,10 +1099,32 @@ def trainModel_ddp(
     global_step = 0
     step_iv = max(1, d4c_log_step_interval())
     grad_iv = max(1, d4c_log_grad_interval())
+    _finite_mode, _finite_warn = parse_d4c_finite_check_mode()
+    if rank == 0 and _lg:
+        if _finite_warn:
+            _lg.warning(
+                "[Diag] %s",
+                _finite_warn,
+                extra=log_route_extra(_lg, ROUTE_SUMMARY),
+            )
+        _lg.info(
+            "[Diag] finite_check_mode=%s（环境变量 D4C_FINITE_CHECK_MODE；默认 loss_only）",
+            _finite_mode,
+            extra=log_route_extra(_lg, ROUTE_SUMMARY),
+        )
+        _lg.info(
+            "[DDP] ddp_find_unused_parameters=%s（来自 FinalTrainingConfig）",
+            bool(final_cfg.ddp_find_unused_parameters),
+            extra=log_route_extra(_lg, ROUTE_SUMMARY),
+        )
+        _lg.info(
+            "[Diag] D4C_GRAD_TOPK=%d（仅 >0 时 log_grad_monitor 打印 top 参数 grad norm）",
+            d4c_grad_topk(),
+            extra=log_route_extra(_lg, ROUTE_SUMMARY),
+        )
     try:
         for epoch in range(epochs):
             sampler.set_epoch(epoch)
-            valid_dataloader.sampler.set_epoch(epoch)
             epoch_1 = epoch + 1
             adv_coef_epoch = _effective_adversarial_coef_epoch(
                 epoch_1,
@@ -1073,44 +1154,54 @@ def trainModel_ddp(
                 micro_step_epoch += 1
                 sync = micro_step_epoch % A == 0
                 sync_ctx = _ddp_no_sync_both(model, discriminator, world_size, sync)
-                user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = _model.gather(batch, device)
+                g = require_gathered_batch(_model.gather(batch, device))
+                user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = (
+                    g.user_idx,
+                    g.item_idx,
+                    g.rating,
+                    g.tgt_input,
+                    g.tgt_output,
+                    g.domain_idx,
+                )
                 bsz = int(user_idx.size(0))
                 warn_empty_batch(_lg, global_step=global_step, epoch=epoch_1, bsz=bsz)
                 if use_adv:
                     # 同一微批上 D 与 G 的两次 backward 须在同一段 no_sync 内，避免中间触发规约
                     with sync_ctx:
-                        pred_rating, context_dist, word_dist, user_hidden, item_hidden = model(
-                            user_idx, item_idx, tgt_input, domain_idx,
-                        )
-                        target_labels = torch.ones(user_hidden.size(0), 1, device=device)
-                        aux_labels = torch.zeros(user_hidden.size(0), 1, device=device)
+                        with d4c_cuda_bf16_autocast():
+                            pred_rating, context_dist, word_dist, user_hidden, item_hidden = model(
+                                user_idx, item_idx, tgt_input, domain_idx,
+                            )
+                            target_labels = torch.ones(user_hidden.size(0), 1, device=device)
+                            aux_labels = torch.zeros(user_hidden.size(0), 1, device=device)
 
-                        aux_u_output, aux_i_output = discriminator(
-                            user_hidden[domain_idx == 0], item_hidden[domain_idx == 0],
-                        )
-                        d_loss_aux_u = adversarial_loss_fn(aux_u_output, aux_labels[domain_idx == 0])
-                        d_loss_aux_i = adversarial_loss_fn(aux_i_output, aux_labels[domain_idx == 0])
-                        target_u_output, target_i_output = discriminator(
-                            user_hidden[domain_idx == 1], item_hidden[domain_idx == 1],
-                        )
-                        d_loss_target_u = adversarial_loss_fn(target_u_output, target_labels[domain_idx == 1])
-                        d_loss_target_i = adversarial_loss_fn(target_i_output, target_labels[domain_idx == 1])
-                        d_loss = (d_loss_aux_u + d_loss_aux_i + d_loss_target_u + d_loss_target_i) / 4.0
+                            aux_u_output, aux_i_output = discriminator(
+                                user_hidden[domain_idx == 0], item_hidden[domain_idx == 0],
+                            )
+                            d_loss_aux_u = adversarial_loss_fn(aux_u_output, aux_labels[domain_idx == 0])
+                            d_loss_aux_i = adversarial_loss_fn(aux_i_output, aux_labels[domain_idx == 0])
+                            target_u_output, target_i_output = discriminator(
+                                user_hidden[domain_idx == 1], item_hidden[domain_idx == 1],
+                            )
+                            d_loss_target_u = adversarial_loss_fn(target_u_output, target_labels[domain_idx == 1])
+                            d_loss_target_i = adversarial_loss_fn(target_i_output, target_labels[domain_idx == 1])
+                            d_loss = (d_loss_aux_u + d_loss_aux_i + d_loss_target_u + d_loss_target_i) / 4.0
                         (d_loss * inv_accum).backward()
 
-                        pred_rating, context_dist, word_dist, user_hidden, item_hidden = model(
-                            user_idx, item_idx, tgt_input, domain_idx,
-                        )
-                        fake_aux_u_output, fake_aux_i_output = discriminator(
-                            user_hidden[domain_idx == 1], item_hidden[domain_idx == 1],
-                        )
-                        g_loss_u = adversarial_loss_fn(fake_aux_u_output, aux_labels[domain_idx == 1])
-                        g_loss_i = adversarial_loss_fn(fake_aux_i_output, aux_labels[domain_idx == 1])
-                        g_loss = (g_loss_u + g_loss_i) / 2.0
-                        loss_r = _model.rating_loss_fn(pred_rating, rating)
-                        loss_e = _model.exp_loss_fn(word_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
-                        loss_c = _model.exp_loss_fn(context_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
-                        loss = 0.1 * loss_r + coef * loss_c + loss_e + adv_coef_epoch * g_loss
+                        with d4c_cuda_bf16_autocast():
+                            pred_rating, context_dist, word_dist, user_hidden, item_hidden = model(
+                                user_idx, item_idx, tgt_input, domain_idx,
+                            )
+                            fake_aux_u_output, fake_aux_i_output = discriminator(
+                                user_hidden[domain_idx == 1], item_hidden[domain_idx == 1],
+                            )
+                            g_loss_u = adversarial_loss_fn(fake_aux_u_output, aux_labels[domain_idx == 1])
+                            g_loss_i = adversarial_loss_fn(fake_aux_i_output, aux_labels[domain_idx == 1])
+                            g_loss = (g_loss_u + g_loss_i) / 2.0
+                            loss_r = _model.rating_loss_fn(pred_rating, rating)
+                            loss_e = _model.exp_loss_fn(word_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
+                            loss_c = _model.exp_loss_fn(context_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
+                            loss = 0.1 * loss_r + coef * loss_c + loss_e + adv_coef_epoch * g_loss
                         (loss * inv_accum).backward()
 
                     if sync:
@@ -1164,13 +1255,14 @@ def trainModel_ddp(
                     adv_sum = adv_sum + g_loss.detach().double() * bsz
                 else:
                     with sync_ctx:
-                        pred_rating, context_dist, word_dist, user_hidden, item_hidden = model(
-                            user_idx, item_idx, tgt_input, domain_idx,
-                        )
-                        loss_r = _model.rating_loss_fn(pred_rating, rating)
-                        loss_e = _model.exp_loss_fn(word_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
-                        loss_c = _model.exp_loss_fn(context_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
-                        loss = 0.1 * loss_r + coef * loss_c + loss_e
+                        with d4c_cuda_bf16_autocast():
+                            pred_rating, context_dist, word_dist, user_hidden, item_hidden = model(
+                                user_idx, item_idx, tgt_input, domain_idx,
+                            )
+                            loss_r = _model.rating_loss_fn(pred_rating, rating)
+                            loss_e = _model.exp_loss_fn(word_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
+                            loss_c = _model.exp_loss_fn(context_dist.view(-1, _model.ntoken), tgt_output.reshape(-1))
+                            loss = 0.1 * loss_r + coef * loss_c + loss_e
                         (loss * inv_accum).backward()
                     if sync:
                         if (global_step + 1) % grad_iv == 0:
@@ -1218,8 +1310,15 @@ def trainModel_ddp(
                 loss_sum = loss_sum + loss.detach().double() * bsz
                 n_samples += bsz
                 if step_count % step_iv == 0 and rank == 0:
-                    check_finite_loss(loss, _lg, global_step=global_step, epoch=epoch_1)
-                    check_finite_tensor(word_dist, _lg, name="word_dist", global_step=global_step, epoch=epoch_1)
+                    run_training_finite_checks(
+                        _finite_mode,
+                        loss,
+                        word_dist,
+                        _lg,
+                        global_step=global_step,
+                        epoch=epoch_1,
+                        route_detail=ROUTE_DETAIL,
+                    )
 
                 # 用于快速验证：跑到指定 steps 后直接退出，观察是否触发 DDP reduction 错误
                 if max_steps is not None and step_count >= max_steps:
@@ -1270,8 +1369,13 @@ def trainModel_ddp(
             is_full_eval_epoch = (
                 checkpoint_metric == "bleu4"
                 and valid_dataset_for_bleu is not None
-                and should_run_full_bleu_eval_epoch(epoch + 1, full_eval_every, full_eval_phased)
+                and should_run_full_bleu_eval_epoch(epoch + 1, fe_sched)
             )
+            if rank == 0 and _lg and checkpoint_metric == "bleu4" and valid_dataset_for_bleu is not None:
+                _lg.info(
+                    format_full_bleu_eval_epoch_decision_log_line(epoch_1, is_full_eval_epoch),
+                    extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                )
             if checkpoint_metric == "bleu4" and valid_dataset_for_bleu is not None:
                 if rank == 0:
                     with d4c_timing_phase(
@@ -1280,11 +1384,14 @@ def trainModel_ddp(
                         route=ROUTE_SUMMARY,
                         rank=0,
                     ):
-                        quick_bleu4 = _valid_bleu4_quick(
+                        quick_bleu4 = explanation_bleu4_quick_score(
                             model,
+                            tokenizer,
                             valid_dataset_for_bleu,
                             device,
                             quick_eval_max_samples,
+                            rank=0,
+                            logger=_lg,
                             dataloader_num_workers=min(2, final_cfg.dataloader_num_workers_valid),
                             dataloader_prefetch_factor=final_cfg.dataloader_prefetch_factor_valid,
                         )
@@ -1303,6 +1410,8 @@ def trainModel_ddp(
                         batch_size=32,
                         dataloader_num_workers=min(2, final_cfg.dataloader_num_workers_valid),
                         dataloader_prefetch_factor=final_cfg.dataloader_prefetch_factor_valid,
+                        logger=_lg if rank == 0 else None,
+                        cfg_override=full_bleu_monitor_cfg_override,
                     )
                     if rank == 0 and _lg:
                         _lg.info(
@@ -1317,14 +1426,14 @@ def trainModel_ddp(
                 if checkpoint_metric == "bleu4" and valid_dataset_for_bleu is not None and quick_bleu4 is not None:
                     if dual_bleu:
                         fstr = f"{full_bleu4_val:.4f}" if full_bleu4_val is not None else "na"
-                        ckpt_src = "full_bleu4" if is_full_eval_epoch else "trend_quick_bleu4"
+                        ckpt_src = "full_bleu_monitor" if is_full_eval_epoch else "trend_quick_bleu4"
                         bleu_line = (
-                            f"quick_bleu4={quick_bleu4:.4f} | full_bleu4={fstr} | "
+                            f"quick_bleu4={quick_bleu4:.4f} | full_bleu_monitor={fstr} | "
                             f"checkpoint_metric_source={ckpt_src}"
                         )
                     else:
                         bleu_line = (
-                            f"quick_bleu4={quick_bleu4:.4f} | full_bleu4="
+                            f"quick_bleu4={quick_bleu4:.4f} | full_bleu_monitor="
                             + (
                                 f"{full_bleu4_val:.4f}"
                                 if full_bleu4_val is not None
@@ -1415,7 +1524,7 @@ def trainModel_ddp(
                             get_underlying_model(model).state_dict(),
                             str(final_cfg.save_file),
                             epoch=epoch_1,
-                            reason="dual_bleu_full_bleu_improved",
+                            reason="dual_bleu_full_bleu_monitor_improved",
                             logger=_lg,
                         )
                 else:
@@ -1450,8 +1559,8 @@ def trainModel_ddp(
                     or valid_loss_stall >= early_stop_patience_loss
                 )
                 _es_line = (
-                    f"early_stop_dual: current_full_bleu4={_cur_full} "
-                    f"best_full_bleu4={best_full_bleu4:.4f} "
+                    f"early_stop_dual: current_full_bleu_monitor={_cur_full} "
+                    f"best_full_bleu_monitor={best_full_bleu4:.4f} "
                     f"full_stall={full_eval_stall}/{early_stop_patience_full} "
                     f"valid_loss_stall={valid_loss_stall}/{early_stop_patience_loss} "
                     f"epoch={epoch + 1} min_epochs={min_epochs} should_stop={_should_stop}"
@@ -1499,9 +1608,17 @@ def _eval_collect_shard_predictions(model, test_dataloader, device):
     # inference_mode 与 no_grad 数值一致，略少开销，适合纯推理
     with torch.inference_mode():
         for batch in test_dataloader:
-            user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx = _model.gather(batch, device)
-            pred_ratings = _model.recommend(user_idx, item_idx, domain_idx)
-            pred_exps, _ = _model.generate(user_idx, item_idx, domain_idx)
+            g = require_gathered_batch(_model.gather(batch, device))
+            user_idx, item_idx, rating, tgt_output, domain_idx = (
+                g.user_idx,
+                g.item_idx,
+                g.rating,
+                g.tgt_output,
+                g.domain_idx,
+            )
+            with d4c_cuda_bf16_autocast():
+                pred_ratings = _model.recommend(user_idx, item_idx, domain_idx)
+                pred_exps, _ = _model.generate(user_idx, item_idx, domain_idx)
             prediction_ratings.extend(pred_ratings.tolist())
             ground_truth_ratings.extend(rating.tolist())
             prediction_exps.extend(tokenizer.batch_decode(pred_exps, skip_special_tokens=True))
@@ -1535,7 +1652,7 @@ def build_config_and_dataloader(args, ddp_rank: int, ddp_world_size: int, local_
     if task_idx is None:
         raise ValueError("未知的 auxiliary/target 组合")
 
-    path = os.path.join(MERGED_DATA_DIR, str(task_idx))
+    path = os.path.join(get_merged_data_dir(), str(task_idx))
     train_df = pd.read_csv(os.path.join(path, "aug_train.csv"))
     nuser = train_df['user_idx'].max() + 1
     nitem = train_df['item_idx'].max() + 1
@@ -1545,7 +1662,8 @@ def build_config_and_dataloader(args, ddp_rank: int, ddp_world_size: int, local_
 
     if batch_size % ddp_world_size != 0:
         raise ValueError(
-            f"DDP eval 要求全局 batch_size ({batch_size}) 能被进程数 ({ddp_world_size}) 整除，请调整 --batch-size。"
+            f"eval_batch_size={batch_size} 与 world_size={ddp_world_size} 不整除，DDP 评测非法。"
+            "请到 presets/eval_profiles/*.yaml 修改 eval_batch_size，或调整 hardware preset 的 ddp_world_size。"
         )
     loader_batch_size = batch_size // ddp_world_size
 
@@ -1553,7 +1671,8 @@ def build_config_and_dataloader(args, ddp_rank: int, ddp_world_size: int, local_
         "task_idx": task_idx,
         "device": primary_device if torch.cuda.is_available() else args.device,
         "log_file": args.log_file,
-        "save_file": args.save_file or os.path.join(get_checkpoint_task_dir(task_idx), "model.pth"),
+        "save_file": args.save_file
+        or os.path.join(get_stage_run_dir(task_idx), "model", "model.pth"),
         "batch_size": loader_batch_size,
         "emsize": 768,
         "nlayers": args.nlayers,
@@ -1569,6 +1688,8 @@ def build_config_and_dataloader(args, ddp_rank: int, ddp_world_size: int, local_
     valid_path = os.path.join(path, "aug_valid.csv")
     valid_df = pd.read_csv(valid_path)
     valid_df['item'] = valid_df['item'].astype(str)
+    valid_df = valid_df.reset_index(drop=True)
+    valid_df["sample_id"] = np.arange(len(valid_df), dtype=np.int64)
     datasets = DatasetDict({
         "valid": Dataset.from_pandas(valid_df)
     })
@@ -1600,7 +1721,7 @@ def build_config_and_dataloader(args, ddp_rank: int, ddp_world_size: int, local_
     valid_dataset = TensorDataset(
         encoded_data['valid']['user_idx'], encoded_data['valid']['item_idx'],
         encoded_data['valid']['rating'], encoded_data['valid']['explanation_idx'],
-        encoded_data['valid']['domain_idx']
+        encoded_data['valid']['domain_idx'], encoded_data['valid']['sample_id'],
     )
     n_samples = len(valid_dataset)
     shard_idx = list(range(ddp_rank, n_samples, ddp_world_size))
@@ -1620,12 +1741,12 @@ def build_config_and_dataloader(args, ddp_rank: int, ddp_world_size: int, local_
         prefetch_factor=_pf_ev,
     )
 
-    suser_profiles = torch.tensor(np.load(os.path.join(DATA_DIR, args.auxiliary, "user_profiles.npy")), dtype=torch.float)
-    sitem_profiles = torch.tensor(np.load(os.path.join(DATA_DIR, args.auxiliary, "item_profiles.npy")), dtype=torch.float)
-    sdomain_profiles = torch.tensor(np.load(os.path.join(DATA_DIR, args.auxiliary, "domain.npy")), dtype=torch.float)
-    tuser_profiles = torch.tensor(np.load(os.path.join(DATA_DIR, args.target, "user_profiles.npy")), dtype=torch.float)
-    titem_profiles = torch.tensor(np.load(os.path.join(DATA_DIR, args.target, "item_profiles.npy")), dtype=torch.float)
-    tdomain_profiles = torch.tensor(np.load(os.path.join(DATA_DIR, args.target, "domain.npy")), dtype=torch.float)
+    suser_profiles = torch.tensor(np.load(os.path.join(get_data_dir(), args.auxiliary, "user_profiles.npy")), dtype=torch.float)
+    sitem_profiles = torch.tensor(np.load(os.path.join(get_data_dir(), args.auxiliary, "item_profiles.npy")), dtype=torch.float)
+    sdomain_profiles = torch.tensor(np.load(os.path.join(get_data_dir(), args.auxiliary, "domain.npy")), dtype=torch.float)
+    tuser_profiles = torch.tensor(np.load(os.path.join(get_data_dir(), args.target, "user_profiles.npy")), dtype=torch.float)
+    titem_profiles = torch.tensor(np.load(os.path.join(get_data_dir(), args.target, "item_profiles.npy")), dtype=torch.float)
+    tdomain_profiles = torch.tensor(np.load(os.path.join(get_data_dir(), args.target, "domain.npy")), dtype=torch.float)
 
     domain_profiles = torch.cat([sdomain_profiles.unsqueeze(0), tdomain_profiles.unsqueeze(0)], dim=0)
     user_profiles = torch.cat([tuser_profiles, suser_profiles], dim=0)
@@ -1664,14 +1785,6 @@ def _run_train_ddp(args):
             break
     if task_idx is None:
         raise ValueError("未知的 auxiliary/target 组合")
-
-    gb = getattr(args, "global_batch_size", None)
-    if gb is not None:
-        if args.batch_size is not None and args.batch_size != gb:
-            raise ValueError(
-                f"--batch-size ({args.batch_size}) 与 --global-batch-size ({gb}) 冲突，请只指定其一或保持一致。"
-            )
-        args.batch_size = gb
 
     if rank == 0:
         log_path, run_id = create_run_paths(task_idx, args.log_file)
@@ -1722,8 +1835,41 @@ def _run_train_ddp(args):
                 "distributed_env": collect_distributed_env_for_meta(),
             }
             log_run_header(train_logger, _meta)
-            log_config_snapshot(train_logger, final_cfg.to_log_dict())
+            _cfg_snap = dict(final_cfg.to_log_dict())
+            _cfg_snap["training_diagnostics"] = training_diagnostics_snapshot(
+                diagnostics_scope="child",
+                effective_training_payload_json=os.environ.get("D4C_EFFECTIVE_TRAINING_PAYLOAD_JSON", ""),
+                ddp_find_unused_parameters_effective=bool(final_cfg.ddp_find_unused_parameters),
+            )
+            _cfg_snap["training_semantic_fingerprint"] = (
+                (os.environ.get("D4C_TRAINING_SEMANTIC_FINGERPRINT") or "").strip() or None
+            )
+            _cfg_snap["generation_semantic_fingerprint"] = (
+                (os.environ.get("D4C_GENERATION_SEMANTIC_FINGERPRINT") or "").strip() or None
+            )
+            _cfg_snap["runtime_diagnostics_fingerprint"] = (
+                (os.environ.get("D4C_RUNTIME_DIAGNOSTICS_FINGERPRINT") or "").strip() or None
+            )
+            _cfg_snap["runtime_env"] = runtime_env_dict_for_config_resolved()
+            log_config_snapshot(train_logger, _cfg_snap)
+            train_logger.info(
+                "[Fingerprints] training_semantic=%s generation_semantic=%s runtime_diag=%s",
+                (os.environ.get("D4C_TRAINING_SEMANTIC_FINGERPRINT") or "").strip() or "n/a",
+                (os.environ.get("D4C_GENERATION_SEMANTIC_FINGERPRINT") or "").strip() or "n/a",
+                (os.environ.get("D4C_RUNTIME_DIAGNOSTICS_FINGERPRINT") or "").strip() or "n/a",
+                extra=log_route_extra(train_logger, ROUTE_SUMMARY),
+            )
             flush_preset_load_events(train_logger)
+            _run_root = os.path.abspath(os.path.join(os.path.dirname(log_path), ".."))
+            _cfg_resolved_path = os.path.join(_run_root, "config_resolved.json")
+            with open(_cfg_resolved_path, "w", encoding="utf-8") as _cf:
+                json.dump(_cfg_snap, _cf, ensure_ascii=False, indent=2, default=str)
+                _cf.write("\n")
+            train_logger.info(
+                "[Config resolved] wrote %s",
+                _cfg_resolved_path,
+                extra=log_route_extra(train_logger, ROUTE_SUMMARY),
+            )
 
         try:
             trainModel_ddp(
@@ -1961,13 +2107,7 @@ def _add_train_args(p):
         "--batch-size",
         type=int,
         default=None,
-        help="训练全局有效 batch（每优化步跨所有 rank 的样本总数）；与 --global-batch-size 同义择一即可",
-    )
-    p.add_argument(
-        "--global-batch-size",
-        type=int,
-        default=None,
-        help="同 --batch-size：显式强调「全局 batch」语义",
+        help="训练全局有效 batch（每优化步跨所有 rank 的样本总数）",
     )
     p.add_argument(
         "--gradient-accumulation-steps",
@@ -2057,12 +2197,6 @@ def _add_train_args(p):
         type=int,
         default=None,
         help="每 epoch quick BLEU 子集；等价 D4C_QUICK_EVAL_MAX_SAMPLES",
-    )
-    p.add_argument(
-        "--full-eval-every",
-        type=int,
-        default=None,
-        help="每 N epoch full valid BLEU；不设且未 export D4C_FULL_EVAL_EVERY 时用分阶段默认",
     )
     p.add_argument(
         "--ddp-find-unused-parameters",

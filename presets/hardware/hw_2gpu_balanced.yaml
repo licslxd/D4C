@@ -1,0 +1,14 @@
+# 双卡 DDP 均衡（评测/训练常用）
+ddp_world_size: 2
+num_proc: 4
+dataloader_workers_train_per_rank_cap: 3
+dataloader_num_workers_valid: 4
+dataloader_num_workers_test: 2
+dataloader_prefetch_factor_train: 2
+dataloader_prefetch_factor_valid: 2
+dataloader_prefetch_factor_test: 2
+max_parallel_cpu: 12
+omp_num_threads: 1
+mkl_num_threads: 1
+tokenizers_parallelism: false
+cuda_visible_devices: "0,1"

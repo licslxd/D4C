@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """对 train.log 做轻量自检（shell 行混入、Epoch 序号连续性）。用法（在项目根）:
-  python code/tools/check_train_log.py /path/to/train.log
-  python code/tools/check_train_log.py log/1/step3_optimized/runs/xxx/train.log --json
+  python code/tools/check_train_log.py runs/task4/v1/train/step5/2_1_1/logs/train.log
+  python code/tools/check_train_log.py runs/task4/v1/train/step5/2_1_1/logs/train.log --json
   python code/tools/check_train_log.py train.log --strict   # 有问题时退出码 2
+
+  legacy：旧仓库布局下的路径（如 log/.../train.log）仅作考古；主线请以 runs/task{T}/vN/train/.../logs/train.log 为准。
 """
 from __future__ import annotations
 

@@ -1,0 +1,13 @@
+decode_strategy: nucleus
+generate_temperature: 0.62
+generate_top_p: 0.82
+repetition_penalty: 1.22
+no_repeat_ngram_size: 3
+min_len: 4
+soft_max_len: 10
+eos_boost_start: 12
+eos_boost_value: 2.0
+tail_temperature: 0.55
+tail_top_p: 0.72
+candidate_family: conservative
+label_smoothing: 0.05

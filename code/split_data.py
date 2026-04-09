@@ -3,7 +3,7 @@ import sys
 import pandas as pd
 from sklearn.model_selection import train_test_split
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from paths_config import DATA_DIR
+from paths_config import get_data_dir
 
 def split_func(df, random_seed=42):
     user_dict = {user: idx for idx, user in enumerate(df['user'].unique())}
@@ -23,9 +23,9 @@ def split_func(df, random_seed=42):
 if __name__ == "__main__":
     datasets = ["AM_Movies", "AM_Electronics", "AM_CDs", "TripAdvisor", "Yelp"]
     for i, dataset in enumerate(datasets):
-        df = pd.read_csv(os.path.join(DATA_DIR, dataset, "processed.csv"))
+        df = pd.read_csv(os.path.join(get_data_dir(), dataset, "processed.csv"))
         train_df, valid_df, test_df = split_func(df)
         print(f"{dataset}: train:{len(train_df)}, valid:{len(valid_df)}, test:{len(test_df)}")
-        train_df.to_csv(os.path.join(DATA_DIR, dataset, "train.csv"), index=False)
-        valid_df.to_csv(os.path.join(DATA_DIR, dataset, "valid.csv"), index=False)
-        test_df.to_csv(os.path.join(DATA_DIR, dataset, "test.csv"), index=False)
+        train_df.to_csv(os.path.join(get_data_dir(), dataset, "train.csv"), index=False)
+        valid_df.to_csv(os.path.join(get_data_dir(), dataset, "valid.csv"), index=False)
+        test_df.to_csv(os.path.join(get_data_dir(), dataset, "test.csv"), index=False)

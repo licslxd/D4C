@@ -7,6 +7,7 @@ import sys
 
 from executors import bootstrap
 from executors import ddp_utils
+from executors.startup_config_check import print_startup_config_check
 
 _STEP5_RUNNER = "step5 runner（torchrun 内部入口）"
 
@@ -23,10 +24,10 @@ def _add_common_run_d4c_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--save_file", type=str, default=None)
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--num-proc", type=int, default=None, help="datasets.map 进程数")
-    p.add_argument("--nlayers", type=int, default=2)
-    p.add_argument("--nhead", type=int, default=2)
+    p.add_argument("--nlayers", type=int, default=4)
+    p.add_argument("--nhead", type=int, default=4)
     p.add_argument("--nhid", type=int, default=2048)
-    p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--dropout", type=float, default=0.15)
     p.add_argument("--label-smoothing", type=float, default=0.1)
     p.add_argument("--repetition-penalty", type=float, default=1.15)
     p.add_argument("--generate-temperature", type=float, default=0.8)
@@ -40,6 +41,20 @@ def _add_common_run_d4c_args(p: argparse.ArgumentParser) -> None:
         help="torchrun 子进程参数；日常请用: python code/d4c.py … --decode-preset <stem>。greedy 可复现；nucleus 可配合 --decode-seed",
     )
     p.add_argument("--decode-seed", type=int, default=None)
+    p.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=None,
+        dest="no_repeat_ngram_size",
+        help="生成时 no_repeat_ngram_size；默认 null（记录于 metrics.decode / generation_semantic_resolved）",
+    )
+    p.add_argument(
+        "--min-len",
+        type=int,
+        default=None,
+        dest="min_len",
+        help="生成最小长度约束；默认 null（记录于 metrics.decode / generation_semantic_resolved）",
+    )
     p.add_argument("--eval-batch-size", type=int, default=None, help="覆盖 FinalTrainingConfig.eval_batch_size 解析链")
     p.add_argument(
         "--eval-single-process-safe",
@@ -69,12 +84,6 @@ def _add_train_cli_args(p: argparse.ArgumentParser) -> None:
         help="不传则 resolve 默认 1e-3",
     )
     p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument(
-        "--global-batch-size",
-        type=int,
-        default=None,
-        help="同 --batch-size",
-    )
     p.add_argument("--gradient-accumulation-steps", type=int, default=None)
     p.add_argument("--per-device-batch-size", type=int, default=None)
     p.add_argument(
@@ -86,10 +95,14 @@ def _add_train_cli_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--early-stop-patience", type=int, default=None)
     p.add_argument("--early-stop-patience-full", type=int, default=None)
     p.add_argument("--early-stop-patience-loss", type=int, default=None)
-    p.add_argument("--checkpoint-metric", type=str, choices=["loss", "bleu4"], default="bleu4")
+    p.add_argument(
+        "--checkpoint-metric",
+        type=str,
+        choices=["loss", "bleu4", "mainline_composite"],
+        default="mainline_composite",
+    )
     p.add_argument("--bleu4-max-samples", type=int, default=None)
     p.add_argument("--quick-eval-max-samples", type=int, default=None)
-    p.add_argument("--full-eval-every", type=int, default=None)
     p.add_argument("--scheduler-initial-lr", type=float, default=None)
     p.add_argument("--warmup-steps", type=int, default=None)
     p.add_argument("--warmup-ratio", type=float, default=None)
@@ -103,7 +116,7 @@ def print_step5_root_help() -> None:
             "Step5 主模型 train / eval / test / generate_samples — torchrun 内部入口（须 NCCL）。"
             "请优先: python code/d4c.py step5|eval|pipeline …"
         ),
-        epilog="子命令完整参数: 在 code/ 薄壳上执行 train --help / eval --help（将加载 PyTorch 等依赖）。",
+        epilog="子命令完整参数: 在 code/ 下对 executors/step5_entry.py 执行 train --help / eval --help（将加载 PyTorch 等依赖）。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = p.add_subparsers(dest="command", required=True)
@@ -153,6 +166,81 @@ def run_step5_cli() -> None:
         parents=[common_parent],
         help="valid 评测（内部由 d4c.py eval / sh 调用）",
     )
+    er = sub.add_parser(
+        "eval-rerank",
+        parents=[common_parent],
+        help="valid 评测 + 多候选 rule rerank（内部由 d4c.py eval-rerank 调用）",
+    )
+    er.add_argument(
+        "--num-return-sequences",
+        type=int,
+        default=None,
+        dest="num_return_sequences",
+        help="每样本生成候选数 K；省略则由父进程 presets/rerank 与默认 4 决定（与 d4c.py 一致）",
+    )
+    er.add_argument(
+        "--rerank-method",
+        type=str,
+        default=None,
+        dest="rerank_method",
+        help="省略则由父进程 presets 决定（与 d4c.py 默认 None 一致）",
+    )
+    er.add_argument("--rerank-top-k", type=int, default=None, dest="rerank_top_k")
+    er.add_argument(
+        "--rerank-weight-logprob",
+        type=float,
+        default=None,
+        dest="rerank_weight_logprob",
+    )
+    er.add_argument(
+        "--rerank-weight-length",
+        type=float,
+        default=None,
+        dest="rerank_weight_length",
+    )
+    er.add_argument(
+        "--rerank-weight-repeat",
+        type=float,
+        default=None,
+        dest="rerank_weight_repeat",
+    )
+    er.add_argument(
+        "--rerank-weight-dirty",
+        type=float,
+        default=None,
+        dest="rerank_weight_dirty",
+    )
+    er.add_argument(
+        "--rerank-target-len-ratio",
+        type=float,
+        default=None,
+        dest="rerank_target_len_ratio",
+    )
+    er.add_argument(
+        "--export-examples-mode",
+        type=str,
+        default=None,
+        choices=("changed_only", "head20", "head50", "full", "none"),
+        dest="export_examples_mode",
+        help="省略则由 presets/rerank 与默认 head50 决定（与 d4c.py 一致）",
+    )
+    er.add_argument(
+        "--export-full-rerank-examples",
+        action="store_true",
+        dest="export_full_rerank_examples",
+    )
+    er.add_argument(
+        "--rerank-malformed-tail-penalty",
+        type=float,
+        default=None,
+        dest="rerank_malformed_tail_penalty",
+    )
+    er.add_argument(
+        "--rerank-malformed-token-penalty",
+        type=float,
+        default=None,
+        dest="rerank_malformed_token_penalty",
+    )
     sub.add_parser(
         "test",
         parents=[common_parent],
@@ -166,14 +254,6 @@ def run_step5_cli() -> None:
     gen_p.add_argument("--generate-max-samples", type=int, default=32)
 
     args = parser.parse_args()
-    gb = getattr(args, "global_batch_size", None)
-    if gb is not None:
-        if getattr(args, "batch_size", None) is not None and args.batch_size != gb:
-            parser.error(
-                f"--batch-size ({args.batch_size}) 与 --global-batch-size ({gb}) 冲突，请只指定其一。"
-            )
-        args.batch_size = gb
-
     ddp_utils.exit_if_not_torchrun(
         executor_label=_STEP5_RUNNER,
         examples=(
@@ -181,6 +261,7 @@ def run_step5_cli() -> None:
             "附录: 高级 torchrun 排障见 docs/D4C_Scripts_and_Runtime_Guide.md。\n"
         ),
     )
+    print_startup_config_check(stage="step5", command=str(args.command))
     if os.environ.get("RANK", "0") == "0":
         print(
             f"[step5 runner] {args.command} — 用户入口: python code/d4c.py step5|eval|pipeline …",
@@ -190,3 +271,7 @@ def run_step5_cli() -> None:
     from executors.step5_engine import _run_ddp  # noqa: E402
 
     _run_ddp(args)
+
+
+if __name__ == "__main__":
+    run_step5_cli()

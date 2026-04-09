@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 启用方式（仓库根目录执行一次）：
 #   git config core.hooksPath .githooks
-# 或：bash sh/install_git_hooks.sh
+# 或：bash scripts/install/install_git_hooks.sh
 # 跳过本次检查：git commit --no-verify
 
 set -euo pipefail
@@ -20,7 +20,7 @@ if printf '%s\n' "$STAGED" | grep -qE '^presets/.*\.(yaml|yml)$|^scripts/check_p
 fi
 
 need_sync_docs=0
-if printf '%s\n' "$STAGED" | grep -q '^sh/.*\.sh$'; then
+if printf '%s\n' "$STAGED" | grep -qE '^scripts/(entrypoints|orchestration|lib)/.*\.sh$'; then
   need_sync_docs=1
 fi
 if printf '%s\n' "$STAGED" | grep -Fxq 'code/paths_config.py'; then
@@ -33,7 +33,7 @@ fi
 
 DOC='docs/D4C_Scripts_and_Runtime_Guide.md'
 if ! printf '%s\n' "$STAGED" | grep -Fxq "$DOC"; then
-  echo 'pre-commit: 检测到已暂存对 sh/*.sh 或 code/paths_config.py 的修改，须在同一提交中同步暂存：' >&2
+  echo 'pre-commit: 检测到已暂存对 scripts/entrypoints|orchestration|lib/*.sh 或 code/paths_config.py 的修改，须在同一提交中同步暂存：' >&2
   echo "  - $DOC" >&2
   echo '（若本次改动不影响文档内容，可仍暂存文档并做一次无实质修改的保存，或改用 git commit --no-verify 跳过。）' >&2
   exit 1

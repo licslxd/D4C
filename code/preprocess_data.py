@@ -4,12 +4,12 @@ import pandas as pd
 import numpy as np
 import pickle
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from paths_config import DATA_DIR
+from paths_config import get_data_dir
 
 if __name__ == "__main__":
     datasets = ["AM_Movies", "AM_Electronics", "AM_CDs", "TripAdvisor", "Yelp"]
     for dataset in datasets:
-        with open(os.path.join(DATA_DIR, dataset, "reviews.pickle"), "rb") as f:
+        with open(os.path.join(get_data_dir(), dataset, "reviews.pickle"), "rb") as f:
             data = pickle.load(f)
         df = pd.DataFrame(data)
         if dataset in ["AM_Movies", "AM_Electronics", "AM_CDs"]:
@@ -41,13 +41,13 @@ if __name__ == "__main__":
             df = filtered_df
             
         print(f"{dataset} filtered to {len(df)} rows.")
-        os.makedirs(os.path.join(DATA_DIR, dataset), exist_ok=True)
-        df.to_csv(os.path.join(DATA_DIR, dataset, "processed.csv"), index=False)
+        os.makedirs(os.path.join(get_data_dir(), dataset), exist_ok=True)
+        df.to_csv(os.path.join(get_data_dir(), dataset, "processed.csv"), index=False)
 
     for dataset in datasets:
-        df = pd.read_csv(os.path.join(DATA_DIR, dataset, "processed.csv"))
+        df = pd.read_csv(os.path.join(get_data_dir(), dataset, "processed.csv"))
         df['explanation'] = df['explanation'].fillna("No explanation provided")
-        df.to_csv(os.path.join(DATA_DIR, dataset, "processed.csv"), index=False)
+        df.to_csv(os.path.join(get_data_dir(), dataset, "processed.csv"), index=False)
 
 
 

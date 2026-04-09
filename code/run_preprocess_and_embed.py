@@ -34,7 +34,7 @@ def _reject_legacy_gpus_argv(argv):
             sys.stderr.write(
                 "run_preprocess_and_embed.py: error: --gpus has been removed.\n"
                 "Use --cuda-device N for single-GPU embedding, or CUDA_VISIBLE_DEVICES.\n"
-                "DDP training is torchrun + AdvTrain.py / run-d4c.py (--nproc_per_node=1 is still DDP).\n"
+                "DDP training is via python code/d4c.py (torchrun + executors/step*_entry.py).\n"
             )
             raise SystemExit(2)
 

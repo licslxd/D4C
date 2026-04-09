@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""从 Step 5 的 train.log（FINAL RESULTS）或 eval_runs.jsonl 汇总 MAE、RMSE、BLEU-4、ROUGE-L。
+"""从 Step 5 的 train.log（FINAL RESULTS）或 eval 汇总 JSONL 汇总 MAE、RMSE、BLEU-4、ROUGE-L。
 
 论文常用：n 次独立试验 (x_1,…,x_n)，报告均值 bar{x} 与样本标准差
 s = sqrt(1/(n-1) * sum (x_i - bar{x})^2)，表中写作 mean ± s。
 n=5 时可注明「5 independent runs」；更稳可增加 seed 数或汇报 bootstrap 区间。
 
 示例:
-  python scripts/multi_seed_paper_stats.py --logs log/multi_seed_runs/*/train_seed_*.log
-  python scripts/multi_seed_paper_stats.py --jsonl log/4/step5_optimized/eval/eval_runs.jsonl --last-n 5
+  python scripts/multi_seed_paper_stats.py --logs 'runs/task4/v1/train/step5/run*/logs/train.log'
+  python scripts/multi_seed_paper_stats.py --logs 'runs/task4/v1/meta/multi_seed/1/train_seed_*.log'
+  python scripts/multi_seed_paper_stats.py --jsonl runs/task4/v1/meta/eval_registry.jsonl --last-n 5
 """
 
 from __future__ import annotations
@@ -111,7 +112,7 @@ def main() -> None:
         default=[],
         help="train.log 路径或 glob（取各文件内最后一次 FINAL RESULTS）",
     )
-    ap.add_argument("--jsonl", type=str, default=None, help="eval_runs.jsonl 路径")
+    ap.add_argument("--jsonl", type=str, default=None, help="eval 注册表 JSONL（如 meta/eval_registry.jsonl）路径")
     ap.add_argument(
         "--last-n",
         type=int,
@@ -122,7 +123,7 @@ def main() -> None:
         "--save-file-contains",
         type=str,
         default=None,
-        help="JSONL 模式下过滤 save_file 子串（如 step5_opt_ms_）",
+        help="JSONL 模式下过滤 save_file 子串（如某次 step5 run 路径片段）",
     )
     ap.add_argument(
         "--latex",

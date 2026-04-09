@@ -1,8 +1,10 @@
-# 与 TRAINING_PRESETS["step3"] 一致（文件名 = 预设名）；Step 3 默认 D4C_TRAIN_PRESET
+# 与 TRAINING_PRESETS["step3"] 一致（文件名 = 预设名）；Step 3 使用 `python code/d4c.py step3 --preset step3`
 1:
   train_batch_size: 1024
   epochs: 30
-  full_eval_every_epochs: 2
+  full_bleu_eval:
+    mode: interval
+    every_epochs: 2
   min_lr_ratio: 0.1
   adv: 0.005
   lr: 5.0e-4
@@ -10,7 +12,9 @@
 2:
   train_batch_size: 1024
   epochs: 30
-  full_eval_every_epochs: 2
+  full_bleu_eval:
+    mode: interval
+    every_epochs: 2
   min_lr_ratio: 0.1
   adv: 0.005
   lr: 1.0e-3
@@ -18,7 +22,9 @@
 3:
   train_batch_size: 1024
   epochs: 30
-  full_eval_every_epochs: 2
+  full_bleu_eval:
+    mode: interval
+    every_epochs: 2
   min_lr_ratio: 0.1
   adv: 0.005
   lr: 5.0e-4
@@ -26,7 +32,9 @@
 4:
   train_batch_size: 1024
   epochs: 30
-  full_eval_every_epochs: 2
+  full_bleu_eval:
+    mode: interval
+    every_epochs: 2
   min_lr_ratio: 0.1
   adv: 0.005
   lr: 1.0e-3
@@ -34,7 +42,9 @@
 5:
   train_batch_size: 1024
   epochs: 30
-  full_eval_every_epochs: 2
+  full_bleu_eval:
+    mode: interval
+    every_epochs: 2
   min_lr_ratio: 0.1
   adv: 0.005
   lr: 1.0e-3
@@ -42,7 +52,9 @@
 6:
   train_batch_size: 1024
   epochs: 30
-  full_eval_every_epochs: 2
+  full_bleu_eval:
+    mode: interval
+    every_epochs: 2
   min_lr_ratio: 0.1
   adv: 0.005
   lr: 1.0e-3
@@ -50,7 +62,9 @@
 7:
   train_batch_size: 1024
   epochs: 30
-  full_eval_every_epochs: 2
+  full_bleu_eval:
+    mode: interval
+    every_epochs: 2
   min_lr_ratio: 0.1
   adv: 0.005
   lr: 1.0e-4
@@ -58,7 +72,9 @@
 8:
   train_batch_size: 1024
   epochs: 30
-  full_eval_every_epochs: 2
+  full_bleu_eval:
+    mode: interval
+    every_epochs: 2
   min_lr_ratio: 0.1
   adv: 0.005
   lr: 5.0e-4

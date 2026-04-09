@@ -1,0 +1,9 @@
+# 为 rerank 产候选：略保守以拉开候选差异
+decode_strategy: nucleus
+generate_temperature: 0.72
+generate_top_p: 0.88
+repetition_penalty: 1.17
+no_repeat_ngram_size: 3
+min_len: 3
+max_explanation_length: 30
+candidate_family: balanced

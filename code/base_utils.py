@@ -7,7 +7,10 @@ _NLTK_LOCAL = os.path.join(_REPO_ROOT, "pretrained_models", "nltk_data")
 if os.path.isdir(_NLTK_LOCAL):
     os.environ.setdefault("NLTK_DATA", _NLTK_LOCAL)
 
-from rouge import rouge
+import re
+from typing import Any, Dict, List, Sequence
+
+from rouge import rouge, rouge_from_word_lists
 from nltk import word_tokenize
 from bleu import compute_bleu
 import logging
@@ -351,3 +354,95 @@ def filter_by_entropy(entropy_values, percentile=0.75):
     threshold = torch.quantile(entropy_tensor, percentile)
     filtered_indices = torch.where(entropy_tensor <= threshold)[0]
     return filtered_indices.tolist()
+
+
+PAPER_METRICS_SCHEMA_VERSION = "d4c_paper_comparable_text/1.0"
+
+
+def paper_tokenize_words(s: str) -> List[str]:
+    """论文可比指标统一分词：NLTK word_tokenize，失败时回退非空白切分。"""
+    try:
+        return word_tokenize(s or "")
+    except Exception:
+        return re.findall(r"\S+", s or "")
+
+
+def compute_paper_comparable_text_metrics(
+    predictions: Sequence[str],
+    references: Sequence[str],
+) -> Dict[str, Any]:
+    """
+    BLEU / ROUGE / 语料级 distinct 均基于 ``paper_tokenize_words``，ROUGE 与 BLEU 词边界一致。
+    显式区分 ratio_0_1（原始比）与 percent_0_100（百分制）。
+    """
+    pred_list = [str(p) if p is not None else "" for p in predictions]
+    ref_list = [str(r) if r is not None else "" for r in references]
+    ptoks = [paper_tokenize_words(p) for p in pred_list]
+    rtoks = [paper_tokenize_words(r) for r in ref_list]
+    formatted_ref = [[r] for r in rtoks]
+
+    bleu_pct: Dict[str, float] = {}
+    bleu_raw: Dict[str, float] = {}
+    for order in (1, 2, 3, 4):
+        try:
+            bleu_n, _, _, _, _, _ = compute_bleu(formatted_ref, ptoks, max_order=order, smooth=False)
+            bleu_raw[str(order)] = round(float(bleu_n), 6)
+            bleu_pct[str(order)] = round(float(bleu_n) * 100.0, 4)
+        except Exception:
+            bleu_raw[str(order)] = 0.0
+            bleu_pct[str(order)] = 0.0
+
+    rscores = rouge_from_word_lists(ptoks, rtoks)
+    rouge_ratio = {k: round(float(v), 6) for k, v in rscores.items()}
+    rouge_pct = {k: round(float(v) * 100.0, 4) for k, v in rscores.items()}
+
+    def _corpus_dist_ratio(sent_toks: List[List[str]], n: int) -> float:
+        unique = set()
+        total = 0
+        for toks in sent_toks:
+            if n == 1:
+                grams = [(t,) for t in toks]
+            else:
+                grams = [tuple(toks[i : i + n]) for i in range(max(0, len(toks) - n + 1))]
+            unique.update(grams)
+            total += len(grams)
+        if total <= 0:
+            return 0.0
+        return float(len(unique)) / float(total)
+
+    d1r = _corpus_dist_ratio(ptoks, 1)
+    d2r = _corpus_dist_ratio(ptoks, 2)
+
+    return {
+        "schema_version": PAPER_METRICS_SCHEMA_VERSION,
+        "tokenization": {
+            "name": "nltk_word_tokenize_with_regex_fallback",
+            "module": "base_utils.paper_tokenize_words",
+        },
+        "bleu": {
+            "scale": "percent_0_100",
+            "1": bleu_pct["1"],
+            "2": bleu_pct["2"],
+            "3": bleu_pct["3"],
+            "4": bleu_pct["4"],
+        },
+        "bleu_raw_ratio": {
+            "scale": "ratio_0_1",
+            "1": bleu_raw["1"],
+            "2": bleu_raw["2"],
+            "3": bleu_raw["3"],
+            "4": bleu_raw["4"],
+        },
+        "rouge": {
+            "scale": "percent_0_100",
+            "rouge_1_f": rouge_pct["rouge_1/f_score"],
+            "rouge_2_f": rouge_pct["rouge_2/f_score"],
+            "rouge_l_f": rouge_pct["rouge_l/f_score"],
+        },
+        "rouge_raw_ratio": {"scale": "ratio_0_1", **rouge_ratio},
+        "distinct_corpus": {
+            "scale_percent_0_100": {"1": round(d1r * 100.0, 4), "2": round(d2r * 100.0, 4)},
+            "scale_ratio_0_1": {"1": round(d1r, 6), "2": round(d2r, 6)},
+        },
+        "note": "repo evaluate_text 仍保留（含空格切分 ROUGE）；本块为统一分词后的论文对照口径",
+    }

@@ -6,7 +6,7 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModel
 import torch
 from tqdm.auto import tqdm
-from paths_config import DATA_DIR, MPNET_DIR
+from paths_config import get_data_dir, get_mpnet_dir
 from config import get_embed_batch_size
 
 def extract_embeddings_in_batches(encoded_inputs, model, device, batch_size=8):
@@ -63,13 +63,14 @@ if __name__ == "__main__":
     else:
         device = torch.device("cpu")
 
-    _mpnet = MPNET_DIR if os.path.exists(MPNET_DIR) else "sentence-transformers/all-mpnet-base-v2"
+    _mpnet_base = get_mpnet_dir()
+    _mpnet = _mpnet_base if os.path.exists(_mpnet_base) else "sentence-transformers/all-mpnet-base-v2"
     tokenizer = AutoTokenizer.from_pretrained(_mpnet)
     model = AutoModel.from_pretrained(_mpnet).to(device)
     all_datasets = ["AM_CDs", "AM_Electronics", "AM_Movies", "TripAdvisor", "Yelp"]
     datasets = [d.strip() for d in args.datasets.split(",")] if args.datasets else all_datasets
     for dataset in datasets:
-        df = pd.read_csv(os.path.join(DATA_DIR, dataset, "train.csv"))
+        df = pd.read_csv(os.path.join(get_data_dir(), dataset, "train.csv"))
         nusers = df['user_idx'].max() + 1
         nitems = df['item_idx'].max() + 1
 
@@ -83,8 +84,8 @@ if __name__ == "__main__":
         embeddings = extract_embeddings_in_batches(encoded_input, model, device, batch_size=batch_size)
         user_embeddings = np.random.rand(nusers, embeddings.shape[1])
         user_embeddings[grouped_reviews.index] = embeddings
-        os.makedirs(os.path.join(DATA_DIR, dataset), exist_ok=True)
-        np.save(os.path.join(DATA_DIR, dataset, "user_profiles.npy"), user_embeddings)
+        os.makedirs(os.path.join(get_data_dir(), dataset), exist_ok=True)
+        np.save(os.path.join(get_data_dir(), dataset, "user_profiles.npy"), user_embeddings)
 
         # item embeddings (同上，处理 review 列中的 NaN/float)
         grouped_reviews = df.groupby('item_idx')['review'].apply(
@@ -96,6 +97,6 @@ if __name__ == "__main__":
         embeddings = extract_embeddings_in_batches(encoded_input, model, device, batch_size=batch_size)
         item_embeddings = np.random.rand(nitems, embeddings.shape[1])
         item_embeddings[grouped_reviews.index] = embeddings
-        np.save(os.path.join(DATA_DIR, dataset, "item_profiles.npy"), item_embeddings)
+        np.save(os.path.join(get_data_dir(), dataset, "item_profiles.npy"), item_embeddings)
         
         

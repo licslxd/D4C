@@ -1,0 +1,21 @@
+# 仅用于 eval-rerank / 多候选生成；不得用于 Step5 主训练 decode 或 best 选模
+decode_strategy: nucleus
+decode_seed: null
+max_explanation_length: 36
+label_smoothing: 0.02
+repetition_penalty: 1.15
+generate_temperature: 0.72
+generate_top_p: 0.88
+no_repeat_ngram_size: 3
+min_len: 4
+soft_max_len: 28
+hard_max_len: 36
+tail_temperature: -1.0
+tail_top_p: -1.0
+forbid_eos_after_open_quote: true
+forbid_eos_after_open_bracket: true
+forbid_bad_terminal_tokens: true
+decode_token_repeat_window: 4
+decode_token_repeat_max: 2
+candidate_family: balanced
+candidate_mixed_include_diverse: true

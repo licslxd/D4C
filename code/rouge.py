@@ -319,3 +319,13 @@ def rouge(hypotheses, references):
       "rouge_2/f_score": rouge_2_f,
       "rouge_l/f_score": rouge_l_f,
   }
+
+
+def rouge_from_word_lists(
+    hyp_word_lists,
+    ref_word_lists,
+):
+  """与 ``rouge(hypotheses, references)`` 同公式，但词序列已统一为外部 tokenizer（如 NLTK）。"""
+  hyp = [" ".join(h) for h in hyp_word_lists]
+  ref = [" ".join(r) for r in ref_word_lists]
+  return rouge(hyp, ref)

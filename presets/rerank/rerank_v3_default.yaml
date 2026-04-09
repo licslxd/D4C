@@ -1,0 +1,3 @@
+# 与 default 等价占位，便于矩阵实验命名区分
+schema_version: d4c_rerank_v3/1.0
+export_examples_mode: head20

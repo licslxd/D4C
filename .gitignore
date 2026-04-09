@@ -14,7 +14,7 @@ htmlcov/
 slurm-*.out
 *.out
 *.err
-# 若有人在仓库根误生成 manifest（正常应在 log/ 下，log/ 已忽略）
+# 若有人在仓库根误生成旧版清单 JSON（正常应在各 run 目录 manifest.json）
 /d4c_run_manifest.json
 
 # 系统/编辑器
@@ -25,6 +25,7 @@ slurm-*.out
 *.log
 
 # 大文件 / 模型 / 数据（不上传到 GitHub）
+runs/
 checkpoints/
 data/
 pretrained_models/
@@ -48,3 +49,4 @@ cache/
 __pycache__/
 *.pyc
 .DS_Store
+_audit_tmp/

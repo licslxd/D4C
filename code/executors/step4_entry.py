@@ -6,6 +6,7 @@ import os
 import sys
 
 from executors import bootstrap
+from executors.startup_config_check import print_startup_config_check
 
 _STEP4_RUNNER = "step4 runner（torchrun 内部入口）"
 
@@ -14,7 +15,7 @@ def print_step4_root_help() -> None:
     p = argparse.ArgumentParser(
         prog="step4-runner",
         description=(
-            "Step4 反事实生成 — torchrun 内部入口（历史兼容薄壳见 code/）。"
+            "Step4 反事实生成 — torchrun 内部入口（executors/step4_entry.py）。"
             "请优先: python code/d4c.py step4 …（仓库根）"
         ),
         epilog="完整参数与运行须 torchrun；日常请使用 code/d4c.py step4。",
@@ -23,7 +24,12 @@ def print_step4_root_help() -> None:
     p.add_argument(
         "--task", type=int, default=None, choices=[1, 2, 3, 4, 5, 6, 7, 8], metavar="N", help="仅跑指定任务 1-8"
     )
-    p.add_argument("--batch-size", type=int, default=None, help="全局 batch（须能被 WORLD_SIZE 整除）")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="全局 eval 推理 batch（= eval_profile.eval_batch_size；须能被 WORLD_SIZE 整除；由 d4c.py 传入）",
+    )
     p.add_argument("--num-proc", type=int, default=None, help="datasets.map 进程数")
     p.add_argument("--log_file", type=str, default=None, help="PerfMonitor 结构化日志路径")
     p.print_help()
@@ -50,7 +56,12 @@ def run_step4_cli() -> None:
     parser.add_argument(
         "--task", type=int, default=None, choices=[1, 2, 3, 4, 5, 6, 7, 8], metavar="N", help="仅跑指定任务 1-8"
     )
-    parser.add_argument("--batch-size", type=int, default=None, help="全局 batch（须能被 WORLD_SIZE 整除）")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="全局 eval 推理 batch（= eval_profile.eval_batch_size；须能被 WORLD_SIZE 整除；由 d4c.py 传入）",
+    )
     parser.add_argument("--num-proc", type=int, default=None, help="datasets.map 进程数")
     parser.add_argument(
         "--log_file",
@@ -59,9 +70,9 @@ def run_step4_cli() -> None:
         help="PerfMonitor 结构化日志路径；不传则沿用当前目录 save.log",
     )
     args = parser.parse_args()
+    print_startup_config_check(stage="step4", command="run")
 
     from executors.step4_engine import (  # noqa: E402 — 重型依赖延后
-        BASE_TRAINING_DEFAULTS,
         _run_one_task,
         _setup_distributed,
         _teardown_distributed,
@@ -83,11 +94,13 @@ def run_step4_cli() -> None:
 
     try:
         for task_idx in task_range:
-            batch_size = (
-                args.batch_size
-                if args.batch_size is not None
-                else int(BASE_TRAINING_DEFAULTS.train_batch_size)
-            )
+            if args.batch_size is None:
+                raise RuntimeError(
+                    "step4 runner 未收到 --batch-size（全局 eval_batch_size）。\n"
+                    "请使用: python code/d4c.py step4 … --eval-profile <stem>\n"
+                    "由父进程解析 eval_profile 后传入 global_eval_batch_size；禁止回退 train_batch_size。"
+                )
+            batch_size = int(args.batch_size)
             lf = args.log_file if args.log_file is not None else "save.log"
             lf = os.path.abspath(os.path.expanduser(lf))
             _run_one_task(
@@ -95,3 +108,7 @@ def run_step4_cli() -> None:
             )
     finally:
         _teardown_distributed()
+
+
+if __name__ == "__main__":
+    run_step4_cli()

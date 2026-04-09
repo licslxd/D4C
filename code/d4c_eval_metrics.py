@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""run-d4c 评测：按 sample_id 合并分片结果、扩展文本指标、落盘。"""
+"""Step5 评测：按 sample_id 合并分片结果、扩展文本指标、落盘。"""
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import re
 from collections import Counter, deque
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from nltk import word_tokenize
 
@@ -215,8 +216,9 @@ def write_eval_digest_log(
     target: str,
     eval_export_tag: str,
     command: str,
+    eval_timing_summary: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """写入 eval_runs/pred_*/eval_digest.log；返回写出文件的绝对路径。"""
+    """写入当次 eval/rerank 产物目录下的 eval_digest.log；返回绝对路径。"""
     sub = os.path.abspath(eval_subdir)
     os.makedirs(sub, exist_ok=True)
     out_path = os.path.join(sub, "eval_digest.log")
@@ -247,12 +249,27 @@ def write_eval_digest_log(
     _kv("repetition_penalty", _digest_label_missing(decode_cfg.get("repetition_penalty")))
     _kv("label_smoothing", _digest_label_missing(decode_cfg.get("label_smoothing")))
     _kv("max_explanation_length", _digest_label_missing(decode_cfg.get("max_explanation_length")))
+    for _dk in (
+        "candidate_family",
+        "soft_max_len",
+        "hard_max_len",
+        "eos_boost_start",
+        "eos_boost_value",
+    ):
+        if _dk in (decode_cfg or {}):
+            _kv(f"decode.{_dk}", _digest_label_missing(decode_cfg.get(_dk)))
     _kv("task_idx", str(int(task_idx)))
     _kv("auxiliary", str(auxiliary))
     _kv("target", str(target))
     _kv("command", str(command))
     _kv("eval_export_tag", str(eval_export_tag))
     lines.append("")
+
+    if eval_timing_summary:
+        _emit("[Eval Timing Summary]")
+        for _tk in sorted(eval_timing_summary.keys()):
+            _kv(f"timing.{_tk}", _digest_fmt_scalar(eval_timing_summary.get(_tk)))
+        lines.append("")
 
     mf = metrics_final if isinstance(metrics_final, dict) else {}
 
@@ -294,6 +311,28 @@ def write_eval_digest_log(
             _kv("metrics.explanation.dist", "missing")
     else:
         _kv("metrics.explanation", "missing")
+
+    pm = mf.get("paper_metrics")
+    if isinstance(pm, dict) and pm:
+        _emit("[Paper-comparable metrics]")
+        _kv("paper_metrics.schema_version", _digest_label_missing(pm.get("schema_version")))
+        tok = pm.get("tokenization")
+        if isinstance(tok, dict):
+            _kv("paper_metrics.tokenization", str(tok.get("name")))
+        pbleu = pm.get("bleu")
+        if isinstance(pbleu, dict):
+            for k in ("1", "2", "3", "4"):
+                _kv(f"paper_metrics.bleu.percent.{k}", _digest_label_missing(pbleu.get(k)))
+        prg = pm.get("rouge")
+        if isinstance(prg, dict):
+            _kv("paper_metrics.rouge.rouge_l_f_pct", _digest_label_missing(prg.get("rouge_l_f")))
+        pdi = pm.get("distinct_corpus")
+        if isinstance(pdi, dict):
+            sp = pdi.get("scale_percent_0_100") or {}
+            if isinstance(sp, dict):
+                _kv("paper_metrics.distinct.corpus.percent.1", _digest_label_missing(sp.get("1")))
+                _kv("paper_metrics.distinct.corpus.percent.2", _digest_label_missing(sp.get("2")))
+        lines.append("")
 
     tmc = mf.get("text_metrics_corpus_and_sentence")
     if isinstance(tmc, dict):
@@ -477,26 +516,6 @@ def eval_decode_tag(*, decode_strategy: str, generate_temperature: float, genera
     ts = str(float(generate_temperature)).replace(".", "p")
     ps = str(float(generate_top_p)).replace(".", "p")
     return f"nucleus_t{ts}_p{ps}"
-
-
-def eval_export_basename(
-    *,
-    ckpt_path: str,
-    task_idx: int,
-    seed: int,
-    split: str,
-    decode_strategy: str = "greedy",
-    generate_temperature: float = 0.8,
-    generate_top_p: float = 0.9,
-) -> str:
-    ck = os.path.splitext(os.path.basename(ckpt_path))[0]
-    tag = eval_decode_tag(
-        decode_strategy=decode_strategy,
-        generate_temperature=generate_temperature,
-        generate_top_p=generate_top_p,
-    )
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"pred_{ck}_task{task_idx}_{split}_seed{seed}_{tag}_{ts}"
 
 
 def compute_collapse_stats(

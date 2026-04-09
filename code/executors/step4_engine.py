@@ -1,8 +1,10 @@
 """
-Step4 执行体核心（ENGINE）：反事实生成主逻辑。
+Step4 执行体核心（ENGINE）：反事实推理生成（与 eval 同属 eval 语义侧）。
 
-由 ``executors.step4_entry`` 在 torchrun 下调用（code/ 下历史薄壳名保持不变）。
-用户入口请使用 ``python code/d4c.py step4 …``。
+全局推理 batch 由父进程根据 ``--eval-profile`` 解析的 ``eval_batch_size`` 传入（torchrun ``--batch-size``），
+须满足与 eval 相同的 strict 整除 ``ddp_world_size`` 规则；**不使用** training 的 ``train_batch_size``。
+
+由 ``executors.step4_entry`` 在 torchrun 下调用；用户入口请使用 ``python code/d4c.py step4 … --eval-profile …``。
 """
 import hashlib
 import os
@@ -24,14 +26,21 @@ from config import (
 )
 from datasets import Dataset, load_from_disk
 from paths_config import (
-    DATA_DIR,
-    MERGED_DATA_DIR,
-    T5_SMALL_DIR,
     append_log_dual,
-    get_checkpoint_task_dir,
+    get_data_dir,
     get_d4c_root,
+    get_merged_data_dir,
+    get_stage_run_dir,
+    get_t5_small_dir,
 )
 from perf_monitor import PerfMonitor
+from train_diagnostics import d4c_cuda_bf16_autocast
+from d4c_core.gather_schema import require_gathered_batch
+from d4c_core.step4_training_export import (
+    assemble_step4_training_table,
+    build_step4_train_manifest,
+    write_step4_training_artifacts,
+)
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset, TensorDataset
@@ -39,15 +48,16 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 _STEP4_REQUIRES_TORCHRUN_MSG = (
     "step4 runner 仅支持 torchrun / python -m torch.distributed.run DDP。\n"
     "用户日常（仓库根）: python code/d4c.py step4 …\n"
-    "请勿在非 torchrun 环境下直接启动薄壳脚本。\n"
+    "请勿在非 torchrun 环境下直接启动 step4_entry。\n"
     "高级排障（须 torchrun，在 code/ 目录）见 docs/D4C_Scripts_and_Runtime_Guide.md 附录。\n"
     "多卡请设置 CUDA_VISIBLE_DEVICES 并使 nproc_per_node 与可见 GPU 数一致。"
 )
 
 # 编码逻辑 / Processor 口径变更时递增，避免误读旧 Arrow 缓存
-_STEP4_ENCODE_CACHE_VERSION = "v1"
+_STEP4_ENCODE_CACHE_VERSION = "v3"
 
-_t5_path = T5_SMALL_DIR if os.path.exists(T5_SMALL_DIR) else "t5-small"
+_t5_base = get_t5_small_dir()
+_t5_path = _t5_base if os.path.exists(_t5_base) else "t5-small"
 tokenizer = T5Tokenizer.from_pretrained(_t5_path, legacy=True)
 
 
@@ -139,24 +149,46 @@ def _step4_read_partial_df(path: str) -> pd.DataFrame:
     return pd.read_csv(path, encoding="utf-8")
 
 
+def _step4_append_primary_log(primary_log_file: str, text: str) -> None:
+    """DDP 多进程追加同一主日志：Linux 下用 flock，避免行被拆散。"""
+    path = os.path.abspath(os.path.expanduser(primary_log_file))
+    log_dir = os.path.dirname(path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    try:
+        import fcntl
+    except ImportError:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(text)
+            f.flush()
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
 class Step4PerfLogger:
-    """各 rank 独立文件，最小侵入性能埋点（与 PerfMonitor 并存）。"""
+    """性能与进度行写入主日志 ``step4.log``（不再生成 ``step4_perf_*.log``）。"""
 
     def __init__(self, log_file: str, task_idx: int, rank: int):
-        log_dir = os.path.dirname(os.path.abspath(os.path.expanduser(log_file)))
-        os.makedirs(log_dir, exist_ok=True)
-        self._path = os.path.join(log_dir, f"step4_perf_task{task_idx}_rank{rank}.log")
+        _ = task_idx
+        self._path = os.path.abspath(os.path.expanduser(log_file))
+        log_dir = os.path.dirname(self._path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         self.rank = rank
 
     def line(self, msg: str) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         text = f"[{ts}] [rank{self.rank}] {msg}\n"
+        print(text, end="", flush=True)
         try:
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(text)
+            _step4_append_primary_log(self._path, text)
         except Exception:
             pass
-        print(text, end="", flush=True)
 
 
 def _format_seconds_human(seconds: float) -> str:
@@ -178,7 +210,6 @@ def _log_step4_final_summary(
     world_size: int,
     n_rows: int,
     log_file: str,
-    plog: Step4PerfLogger,
     step4_end_to_end_wall_s: float,
     preprocess_wall_s: float,
     inference_loop_wall_s: float,
@@ -191,7 +222,7 @@ def _log_step4_final_summary(
     trainer_epoch_time_s: float | None,
     inference_only_avg_step_ms: float,
 ) -> None:
-    """rank0：train.log / stdout / step4_perf 三处写入 Step4 端到端摘要（不改变训练器原有 Epoch 输出）。"""
+    """rank0：stdout + ``step4.log``（经 append_log_dual）；摘要块不重复写入 perf 侧车文件。"""
     e2e = step4_end_to_end_wall_s
     decode_tail_s = decode_local_wall_s
     infer_pct = _step4_pct(inference_loop_wall_s, e2e)
@@ -223,9 +254,6 @@ def _log_step4_final_summary(
         f"  trainer_epoch_time_s={trainer_s_str}\n"
         f"  note=trainer_epoch_time_excludes_decode_merge_csv_tail"
     )
-    for ln in mach.splitlines():
-        msg = ln.removeprefix("[rank0] ") if ln.startswith("[rank0] ") else ln
-        plog.line(msg)
     append_log_dual(log_file, mach + "\n")
 
     trainer_h = (
@@ -239,8 +267,6 @@ def _log_step4_final_summary(
         f"Actual step4 end-to-end time: {_format_seconds_human(e2e)} "
         f"(step4_end_to_end_wall_s={e2e:.4f} s; scope=full_task incl. preprocess, decode, merge, csv).",
     ]
-    for _ln in human_lines:
-        plog.line(_ln)
     append_log_dual(log_file, "\n".join(f"[rank0] {_ln}" for _ln in human_lines) + "\n")
 
     block = (
@@ -334,7 +360,9 @@ def _run_one_task(
     task_config = TASK_DEFAULTS[task_idx]
     auxiliary = task_config["auxiliary"]
     target = task_config["target"]
-    _task_ckpt_dir = get_checkpoint_task_dir(task_idx)
+    _task_ckpt_dir = get_stage_run_dir(task_idx)
+    _step3_stage = (os.environ.get("D4C_STEP3_RUN_DIR") or "").strip()
+    _model_root = _step3_stage if _step3_stage else _task_ckpt_dir
     # gather 之后不再用 dist.barrier 等 rank0 decode/CSV；用文件握手让 rank!=0 在下一轮任务/销毁进程组前等待 rank0 写完 CSV（纯 CPU，避免 NCCL 长时间 barrier 超时）。
     sync_ready_path = os.path.join(_task_ckpt_dir, f".step4_ddp_task_{task_idx}_ready")
     if rank == 0 and world_size > 1:
@@ -343,29 +371,37 @@ def _run_one_task(
         except OSError:
             pass
 
-    save_file = os.path.join(_task_ckpt_dir, "model.pth")
+    save_file = os.path.join(_model_root, "model", "model.pth")
 
     device = f"cuda:{local_rank}"
     if batch_size % world_size != 0:
         raise ValueError(
-            f"DDP 推理要求全局 --batch-size ({batch_size}) 能被进程数 ({world_size}) 整除，"
-            "与 Step 3/5 一致；单卡请 DDP_NPROC=1。"
+            f"step4 要求 global_eval_batch_size（当前 {batch_size}）能被 world_size={world_size} 整除，"
+            "与 eval / step5 valid 相同的 strict 规则；请调整 presets/eval_profiles/<profile>.yaml 的 "
+            "eval_batch_size 或 presets/hardware/<hw>.yaml 的 ddp_world_size。"
         )
     local_batch = batch_size // world_size
     if rank == 0:
+        _epn = (os.environ.get("D4C_EVAL_PROFILE_NAME") or "").strip()
         print(
-            f"[Step4 DDP] task={task_idx} global_batch={batch_size} per_rank_batch={local_batch} world_size={world_size}",
+            "[step4 eval inference] "
+            f"eval_profile_name={_epn!r} "
+            f"global_eval_batch_size={batch_size} "
+            f"eval_per_gpu_batch_size={local_batch} "
+            f"world_size={world_size}",
             flush=True,
         )
 
     plog = Step4PerfLogger(log_file, task_idx, rank)
 
-    path = os.path.join(MERGED_DATA_DIR, str(task_idx))
+    path = os.path.join(get_merged_data_dir(), str(task_idx))
     aug_csv = os.path.join(path, "aug_train.csv")
     train_df = pd.read_csv(aug_csv)
     train_df["item"] = train_df["item"].astype(str)
     nuser = train_df["user_idx"].max() + 1
     nitem = train_df["item_idx"].max() + 1
+    # 与 step3 / step5 一致：反事实编码仅使用有 explanation 的行
+    train_df = train_df[train_df["explanation"].notna()].reset_index(drop=True)
     config = {
         "task_idx": task_idx,
         "device": device,
@@ -386,22 +422,22 @@ def _run_one_task(
     }
 
     suser_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, auxiliary, "user_profiles.npy")), dtype=torch.float, device=device
+        np.load(os.path.join(get_data_dir(), auxiliary, "user_profiles.npy")), dtype=torch.float, device=device
     )
     sitem_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, auxiliary, "item_profiles.npy")), dtype=torch.float, device=device
+        np.load(os.path.join(get_data_dir(), auxiliary, "item_profiles.npy")), dtype=torch.float, device=device
     )
     sdomain_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, auxiliary, "domain.npy")), dtype=torch.float, device=device
+        np.load(os.path.join(get_data_dir(), auxiliary, "domain.npy")), dtype=torch.float, device=device
     )
     tuser_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, target, "user_profiles.npy")), dtype=torch.float, device=device
+        np.load(os.path.join(get_data_dir(), target, "user_profiles.npy")), dtype=torch.float, device=device
     )
     titem_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, target, "item_profiles.npy")), dtype=torch.float, device=device
+        np.load(os.path.join(get_data_dir(), target, "item_profiles.npy")), dtype=torch.float, device=device
     )
     tdomain_profiles = torch.tensor(
-        np.load(os.path.join(DATA_DIR, target, "domain.npy")), dtype=torch.float, device=device
+        np.load(os.path.join(get_data_dir(), target, "domain.npy")), dtype=torch.float, device=device
     )
 
     domain_profiles = torch.cat([sdomain_profiles.unsqueeze(0), tdomain_profiles.unsqueeze(0)], dim=0)
@@ -427,6 +463,7 @@ def _run_one_task(
 
     target_df = train_df[train_df["domain"] == "target"].copy()
     target_df["domain"] = "auxiliary"
+    target_df["sample_id"] = np.arange(len(target_df), dtype=np.int64)
     target_dataset = Dataset.from_pandas(target_df)
     processor = Processor(auxiliary, target)
     proc_max_len = int(processor.max_length)
@@ -490,9 +527,8 @@ def _run_one_task(
     encoded_data.set_format("torch")
 
     n_samples = len(encoded_data)
-    row_idx = torch.arange(n_samples, dtype=torch.long)
     full_dataset = TensorDataset(
-        row_idx,
+        encoded_data["sample_id"],
         encoded_data["user_idx"],
         encoded_data["item_idx"],
         encoded_data["rating"],
@@ -553,17 +589,25 @@ def _run_one_task(
 
             data_wait_s = t_batch_start - t_prev_end
 
-            batch_row_idx, user_idx, item_idx, rating, tgt_output, domain_idx = batch
+            batch_sample_id, user_idx, item_idx, rating, tgt_output, domain_idx = batch
             t_gather0 = time.perf_counter()
-            user_idx, item_idx, rating, _tgt_input, tgt_output, domain_idx = _model.gather(
-                (user_idx, item_idx, rating, tgt_output, domain_idx), device
+            gb = require_gathered_batch(
+                _model.gather(
+                    (user_idx, item_idx, rating, tgt_output, domain_idx, batch_sample_id), device
+                )
             )
+            user_idx = gb.user_idx
+            item_idx = gb.item_idx
+            rating = gb.rating
+            tgt_output = gb.tgt_output
+            domain_idx = gb.domain_idx
             gather_h2d_s = time.perf_counter() - t_gather0
 
             # Step4 生成路径不依赖 recommend() 的 rating；generate() 内部自包含 encoder。
             # 去掉 recommend() 可省一次完整 transformer 前向（与 generate 第一步结构重复）。
             t_gen0 = time.perf_counter()
-            pred_exps, entropy = _model.generate(user_idx, item_idx, domain_idx)
+            with d4c_cuda_bf16_autocast():
+                pred_exps, entropy = _model.generate(user_idx, item_idx, domain_idx)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             generate_wall_s = time.perf_counter() - t_gen0
@@ -574,7 +618,7 @@ def _run_one_task(
             entropy_sync_wall_s = time.perf_counter() - t_ent0
 
             decode_wall_s = 0.0
-            local_row_indices.extend(batch_row_idx.detach().cpu().reshape(-1).tolist())
+            local_row_indices.extend(batch_sample_id.detach().cpu().reshape(-1).tolist())
             local_pred_token_rows.extend(pred_exps.detach().cpu().tolist())
             local_entropy_values.extend(ent_list)
 
@@ -738,14 +782,20 @@ def _run_one_task(
         filtered_target_df = target_df.iloc[filtered_indices].copy()
         filtered_target_df["explanation"] = filtered_prediction_exps
 
-        updated_train_df = train_df[train_df["domain"] == "target"].copy()
-        final_df = pd.concat([updated_train_df, filtered_target_df])
+        final_df = assemble_step4_training_table(train_df, filtered_target_df)
+        manifest = build_step4_train_manifest(
+            final_df,
+            n_cf_entropy_input=int(n_samples),
+            n_cf_entropy_kept=int(len(filtered_indices)),
+        )
         os.makedirs(_task_ckpt_dir, exist_ok=True)
-        final_df.to_csv(os.path.join(_task_ckpt_dir, "factuals_counterfactuals.csv"), index=False)
+        csv_out, man_out = write_step4_training_artifacts(final_df, manifest, _task_ckpt_dir)
         csv_write_wall_s = time.perf_counter() - t_csv0
-        print(
-            f"Task {task_idx}: 已写入 {os.path.join(_task_ckpt_dir, 'factuals_counterfactuals.csv')}",
-            flush=True,
+        print(f"Task {task_idx}: 已写入 {csv_out}", flush=True)
+        print(f"Task {task_idx}: manifest {man_out}", flush=True)
+        append_log_dual(
+            log_file,
+            f"[rank0] step4_train_table rows={len(final_df)} manifest={man_out}\n",
         )
         plog.line(f"csv_write_wall_s={csv_write_wall_s:.4f}")
 
@@ -784,7 +834,6 @@ def _run_one_task(
             world_size=world_size,
             n_rows=n_samples,
             log_file=log_file,
-            plog=plog,
             step4_end_to_end_wall_s=step4_end_to_end_wall_s,
             preprocess_wall_s=preprocess_wall,
             inference_loop_wall_s=inference_loop_wall_s,

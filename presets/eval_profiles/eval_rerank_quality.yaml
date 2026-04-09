@@ -1,0 +1,6 @@
+# rerank 质量向：多候选 + 质量优先 rerank
+hardware_preset: hw_2gpu_balanced
+decode_preset: decode_candidate_nucleus_v2
+rerank_preset: rerank_v3_quality_first
+eval_batch_size: 2048
+num_return_sequences: 4

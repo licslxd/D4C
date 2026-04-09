@@ -21,6 +21,7 @@
 - [八、常见问题](#八常见问题)
 - [九、目录结构](#九目录结构)
 - [十、最小依赖列表](#十最小依赖列表)
+- [历史 torchrun / legacy（考古）](docs/legacy_offline_torchrun.md) · [Legacy 批量 Shell](docs/legacy_batch_shell.md)
 
 ---
 
@@ -78,42 +79,24 @@ pip install --no-index --find-links=./offline_wheels -r requirements_offline.txt
 
 ### 3. 运行
 
-**推荐（项目根 `D4C-main/`）**：Python 实验 **`python code/d4c.py …`** 为 **MAINLINE ENTRY**（见 `docs/D4C_Scripts_and_Runtime_Guide.md`）；主线叙事为 **step3 / step4 / step5 runner**，由 **`d4c_core.runners`** 在子进程内 `torchrun` 拉起（`code/` 下历史薄壳文件名仅作加载用，日常不必记）。亦可使用 **`sh/run_step1_step2.sh`** 与 **`sh/run_step*_optimized.sh`**（编排层内部同样调 `d4c.py`）；`scripts/train_ddp.sh` 亦直接调 `d4c.py`。排障时可 `export D4C_DISPATCH_DETAIL=1` 查看实际薄壳名；**默认**在 `<log_dir>/d4c_run_manifest.json` 写入运行清单（`D4C_WRITE_RUN_MANIFEST=0` 可关闭）。详见 **README** 与下文「五、一键批量运行脚本」。
+**推荐（项目根 `D4C-main/`）**：Python 实验 **`python code/d4c.py …`** 为 **MAINLINE ENTRY**（见 `docs/D4C_Scripts_and_Runtime_Guide.md`）；子进程由 **`d4c_core.runners`** `torchrun` **`code/executors/step{3,4,5}_entry.py`**。单阶段 Shell 用 **`scripts/entrypoints/step*.sh`**；**官方 Bash 批量**用 **`scripts/entrypoints/train_ddp.sh`**。排障：`export D4C_DISPATCH_DETAIL=1`。**默认**在当次 run 目录写 **`manifest.json`**（`manifest_schema_version` 2.0 起为纯结构化字段；`D4C_WRITE_RUN_MANIFEST=0` 可关闭）。
 
-**历史 / 演示（不再推荐）**：`code/legacy/run_all.sh` 或下列分步命令**不**经过 `sh/` 的路径与环境变量约定，仅作考古对照。
-
-```bash
-cd D4C-main
-chmod +x code/legacy/run_all.sh
-bash code/legacy/run_all.sh
-```
-
-或分步执行：
-
-```bash
-cd D4C-main/code
-python preprocess_data.py && python split_data.py && python combine_data.py
-python compute_embeddings.py && python infer_domain_semantics.py
-DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 AdvTrain.py train --auxiliary AM_Electronics --target AM_CDs --epochs 50
-DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 AdvTrain.py eval --auxiliary AM_Electronics --target AM_CDs
-DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 generate_counterfactual.py
-DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 run-d4c.py --auxiliary AM_Electronics --target AM_CDs --epochs 50
-```
+**历史 / 演示（不再推荐）**：直连 `torchrun` 与 `legacy/run_all.sh` 的命令已迁至 **`docs/legacy_offline_torchrun.md`**，避免与主线并列误读。
 
 **常用命令速查（主线）：**
 
 ```bash
 # 项目根：Step3 → Step4 → Step5（参数见 python code/d4c.py -h）
-python code/d4c.py step3 --task 1 --preset step3
-python code/d4c.py step4 --task 1 --preset step3 --from-run step3_opt_YYYYMMDD_HHMM
-python code/d4c.py step5 --task 1 --preset step5 --from-run step3_opt_YYYYMMDD_HHMM --step5-run step5_opt_YYYYMMDD_HHMM
+python code/d4c.py step3 --task 1 --preset step3 --iter v1
+python code/d4c.py step4 --task 1 --preset step3 --iter v1 --from-run 1 --eval-profile eval_fast_single_gpu
+python code/d4c.py step5 --task 1 --preset step5 --iter v1 --from-run 2 --step4-run 2_1 --step5-run auto --eval-profile eval_fast_single_gpu
 
 # DDP 链路自检
 python code/d4c.py smoke-ddp
-# 等价：bash sh/smoke_test_ddp.sh
+# 等价：bash scripts/entrypoints/smoke_ddp.sh
 ```
 
-**附录（仅考古 / 手写排障）**：在 `code/` 目录直接 `torchrun …` 历史薄壳名的命令见下文「四、完整运行流程」各 Step 末尾代码块；日常请优先上表 `d4c.py`。
+**附录（仅考古 / 手写排障）**：见 **`docs/legacy_offline_torchrun.md`**；日常请优先上表 `d4c.py`。
 
 ---
 
@@ -122,7 +105,7 @@ python code/d4c.py smoke-ddp
 - **核心任务**：跨域推荐解释生成（Domain-aware Counterfactual）
 - **框架**：PyTorch + Hugging Face Transformers
 - **Python 主入口（MAINLINE）**：`python code/d4c.py step3|step4|step5|eval|pipeline|smoke-ddp …`（项目根，详见 `docs/D4C_Scripts_and_Runtime_Guide.md`）
-- **阶段 runner**：由 `d4c_core.runners` 经 `torchrun` 调度；**核心逻辑**在 `code/executors/*_engine.py`；`code/` 下若干 `*.py` 薄壳仅保留历史文件名供加载，认知上以 step3/4/5 runner 为准
+- **阶段 runner**：由 `d4c_core.runners` 经 `torchrun` 调度 **`code/executors/step{3,4,5}_entry.py`**；核心逻辑在 `code/executors/*_engine.py`
 - **数据**：AM_CDs、AM_Electronics、AM_Movies、TripAdvisor、Yelp
 
 ---
@@ -294,72 +277,29 @@ python run_preprocess_and_embed.py --embed-batch-size 64
 
 ### Step 3：域对抗预训练（对每个任务运行一次）
 
-Step 3 **仅支持 DDP**（eval 在 valid 上分片推理，rank0 聚合指标）。**推荐**在项目根使用 **`python code/d4c.py step3 --task N --preset step3 …`** 或 **`bash sh/run_step3_optimized.sh`**（内部同样调 `d4c.py`）。
-
-**附录：在 `code/` 目录手工 `torchrun` 薄壳（排障/考古；薄壳名可能随仓库历史保留）**
-
-```bash
-# 单卡等价：nproc=1
-DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 AdvTrain.py train \
-  --auxiliary AM_Electronics --target AM_CDs --epochs 50
-DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 AdvTrain.py eval \
-  --auxiliary AM_Electronics --target AM_CDs
-
-# 多卡（如 2 张 GPU；全局 batch 须能被进程数整除，见 config.train_batch_size）
-CUDA_VISIBLE_DEVICES=0,1 DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 AdvTrain.py train \
-  --auxiliary AM_Movies --target AM_CDs --epochs 50
-DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 AdvTrain.py eval \
-  --auxiliary AM_Movies --target AM_CDs
-```
-
-其余 6 组 (auxiliary, target) 按 `config.py` 中任务表逐对运行；若需库级导入，仍可使用历史模块名 `from AdvTrain import *`（见源码说明）。
+Step 3 **仅支持 DDP**（eval 在 valid 上分片推理，rank0 聚合指标）。**推荐**在项目根使用 **`python code/d4c.py step3 --task N --preset step3 …`** 或 **`bash scripts/entrypoints/step3.sh`**（内部同样调 `d4c.py`）。手工 `torchrun` 薄壳命令见 **`docs/legacy_offline_torchrun.md`**。
 
 ### Step 4：生成反事实数据
 
-**推荐**：`python code/d4c.py step4 --task N --preset … --from-run <Step3 子目录名> …` 或 `bash sh/run_step4_optimized.sh …`。
-
-**附录：手工 `torchrun`（在 `code/` 目录）**
-
-```bash
-DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 generate_counterfactual.py
-CUDA_VISIBLE_DEVICES=0,1 DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 generate_counterfactual.py
-```
+**推荐**：`python code/d4c.py step4 … --from-run <Step3 子目录名> --eval-profile <stem>`（推理 batch 仅来自该 profile 的 `eval_batch_size`）或 `bash scripts/entrypoints/step4.sh …`。手工 `torchrun` 见 **`docs/legacy_offline_torchrun.md`**。
 
 ### Step 5：主训练与评估（仅 DDP）
 
-**推荐**：`python code/d4c.py step5 …` / `python code/d4c.py eval …`，或 `bash sh/run_step5_optimized.sh …` / `bash sh/run_step5_all.sh`。
-
-**附录：手工 `torchrun`（在 `code/` 目录）**
-
-```bash
-DDP_NPROC=1 torchrun --standalone --nproc_per_node=1 run-d4c.py \
-  --auxiliary AM_Electronics --target AM_CDs --epochs 50
-DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 run-d4c.py \
-  --auxiliary AM_Electronics --target AM_CDs --epochs 50 --batch-size 1024
-```
+**推荐**：`python code/d4c.py step5 …` / `eval …`，或 `bash scripts/entrypoints/step5.sh …`；批量用 **`bash scripts/entrypoints/train_ddp.sh`**。手工 `torchrun` 见 **`docs/legacy_offline_torchrun.md`**。
 
 ---
 
 ## 五、一键批量运行脚本
 
-**Shell 编排入口**：项目根 **`sh/run_step*_optimized.sh`** 及下表串联脚本（批量/集群；**内部调用 `python code/d4c.py`**，再由 `d4c_core.runners` `torchrun` 各 **step runner**）。**Python 首选**仍为 **`python code/d4c.py …`**。
+**官方 Bash 批量入口（推荐）**：项目根 **`bash scripts/entrypoints/train_ddp.sh`**（GPU/DDP 校验后多次调用 **`python code/d4c.py`**）。参数与示例见 **`docs/D4C_Scripts_and_Runtime_Guide.md`** §4.6。
 
-**`code/legacy/run_all.sh`**：**历史 / 演示脚本**（Step 3 默认 `DDP_NPROC=1`；多卡可 `DDP_NPROC=2 bash code/legacy/run_all.sh`），不经过 `sh/` 的路径逻辑；日常训练请优先用 **`python code/d4c.py …`** 或下方表格中的 **`sh/run_step*_optimized.sh`**。
+**单阶段 Shell（`scripts/entrypoints/`）**：`step1_step2.sh`、`step3.sh`、`step4.sh`、`step5.sh`、`smoke_ddp.sh` 等 — 细节见主指南 §1 与 §4。
 
-**便捷脚本（项目根目录 `sh/`，需先 `cd` 到 `D4C-main` 再执行，或写绝对路径）：**
+**Legacy 串联脚本**（已迁出主线 **`sh/`**，考古用）：`legacy/sh/run_step3_to_step5_all.sh`、`legacy/sh/run_step3_to_step5_single.sh`、`legacy/sh/run_step5_all.sh` — 见 **`docs/legacy_batch_shell.md`**。
 
-| 脚本 | 用途 |
-|------|------|
-| `run_step1_step2.sh` | Step 1+2 合并，支持 `--embed-batch-size N`、`--cuda-device N`（嵌入单卡） |
-| `run_step3_optimized.sh` | Step 3（DDP）：train 与 eval 均 `torchrun`；`DDP_NPROC` 或 `--ddp-nproc K`（`=1` 为单卡 DDP smoke，仍为同一主路径） |
-| `run_step4_optimized.sh` | Step 4，**必填 `--step3-subdir`**（与 `checkpoints/<task>/step3_optimized/<NAME>/` 一致），`--all` / `--task N`；内部 **`d4c.py step4` → step4 runner** |
-| `run_step5_optimized.sh` | Step 5（DDP）**仅嵌套**：`--task N` + `--step3-subdir`；`DDP_NPROC` 或 `--ddp-nproc K`（无 `--all`） |
-| `run_step5_all.sh` | Step 5 **批量任务 1–8**：仅调 `run_step5_optimized.sh`，每任务自动最新 `step3_opt_*`；`--eval-only` 时再自动最新 `step5_opt_*`；汇总 `log/step5_all_*.log` |
-| `run_step3_to_step5_all.sh` | Step 3-5 全部任务，支持 `--from N` 续跑、`--ddp-nproc K`；多卡请 **`CUDA_VISIBLE_DEVICES`** 与进程数对齐；**已移除 `--gpus`**（传入则报错） |
-| `smoke_test_ddp.sh` | **DDP smoke**：极小 Step3 train/eval + Step4 + Step5，验证不 crash；产物在 **`checkpoints/1/smoke_ddp/`** |
-| `run_step3_to_step5_single.sh` | Step 3-5 单个任务，`--task N`，同上 |
+**历史顺序演示**：`legacy/code/run_all.sh`（见 **`docs/legacy_offline_torchrun.md`**）。
 
-**集群 / 长任务（`tmux-slurm/`）**：Slurm 提交、tmux 与 nohup 包装脚本及说明见 [`tmux-slurm/README.md`](tmux-slurm/README.md)（须在项目根目录执行 `sbatch` / 调用脚本）。
+**集群 / 长任务**：自行用 Slurm/tmux/nohup 包装 **`python code/d4c.py …`** 或 **`scripts/entrypoints/train_ddp.sh`**；参数须与主指南一致。
 
 ---
 
@@ -368,10 +308,9 @@ DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 run-d4c.py \
 - **项目根目录**：默认 `D4C-main/`，可通过环境变量 `D4C_ROOT` 覆盖
 - **数据目录**：`{D4C_ROOT}/data/`
 - **Merged 数据**：`{D4C_ROOT}/Merged_data/1` ~ `8`
-- **模型权重**：`checkpoints/{task_idx}/model.pth`（项目根目录下）
-- **反事实数据**：`checkpoints/{task_idx}/factuals_counterfactuals.csv`
-
-若此前权重保存在旧路径 `code/checkpoints/`，请整目录迁移到项目根 `checkpoints/`，或设置环境变量 `D4C_ROOT` 后保持相对关系一致。
+- **训练与评测正式产物**：`runs/task{T}/vN/train/step3/<run>/`、`.../train/step5/<run>/`、`.../eval/<run>/` 等（见 `docs/D4C_Scripts_and_Runtime_Guide.md`）
+- **Step5 权重文件**：`runs/.../train/step5/<run>/model/model.pth`
+- **反事实 CSV**：位于对应 **Step3 run** 目录：`runs/.../train/step3/<run>/factuals_counterfactuals.csv`
 
 ---
 
@@ -385,7 +324,7 @@ DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 run-d4c.py \
 | `infer_domain_semantics.py` | 无 | 1 | 按 chunk 逐个处理，基本不占显存 |
 | step3 runner（`d4c step3` / `torchrun`） | 全局 `--batch-size` / `config.train_batch_size` | 见 config | DDP 下每 rank 的 DataLoader batch = 全局 / 进程数 |
 | step5 runner（`d4c step5` / `torchrun`） | 全局 `--batch-size` / `config.train_batch_size` | 见 config | DDP 下每卡 batch = 全局 / 进程数 |
-| step4 runner（`d4c step4` / `torchrun`） | `--batch-size` / 默认 `train_batch_size` | 见 config | **`torchrun` DDP**：全局 batch，须能被 `WORLD_SIZE` 整除 |
+| step4 runner（`d4c step4` / `torchrun`） | 父进程传入 `--batch-size` = **`eval_profile.eval_batch_size`**（须 `--eval-profile`） | 见 `presets/eval_profiles/` | **`torchrun` DDP**：全局 eval batch，须能被 `WORLD_SIZE` 整除；**不再**使用 `train_batch_size` |
 
 **调整方式：**
 
@@ -400,16 +339,16 @@ DDP_NPROC=2 torchrun --standalone --nproc_per_node=2 run-d4c.py \
 
 ```bash
 # Step 1+2：嵌入为单卡（可调 batch 与 --cuda-device）
-bash sh/run_step1_step2.sh --embed-batch-size 1024 --cuda-device 0
+bash scripts/entrypoints/step1_step2.sh --embed-batch-size 1024 --cuda-device 0
 
 # Step 3 / 4 / 5：推荐在项目根使用 d4c.py（内部再 torchrun）
-python code/d4c.py step3 --task 1 --preset step3
-python code/d4c.py step4 --task 1 --preset step3 --from-run step3_opt_YYYYMMDD_HHMM
-python code/d4c.py step5 --task 1 --preset step5 --from-run step3_opt_YYYYMMDD_HHMM --step5-run step5_opt_YYYYMMDD_HHMM
+python code/d4c.py step3 --task 1 --preset step3 --iter v1
+python code/d4c.py step4 --task 1 --preset step3 --iter v1 --from-run 1 --eval-profile eval_fast_single_gpu
+python code/d4c.py step5 --task 1 --preset step5 --iter v1 --from-run 2 --step4-run 2_1 --step5-run auto --eval-profile eval_fast_single_gpu
 ```
 
-- 单卡自检：`python code/d4c.py smoke-ddp` 或 `DDP_NPROC=1 torchrun …`（附录薄壳命令）
-- 历史脚本 **`code/legacy/train.py`**、**`code/legacy/naive_counterfactual_train.py`** 为旧实验入口，**不属于**当前统一 DDP pipeline
+- 单卡自检：`python code/d4c.py smoke-ddp`；手写 `torchrun` 见 **`docs/legacy_offline_torchrun.md`**
+- 历史脚本在 **`legacy/code/`**（索引 **`legacy/README.md`**）
 
 ---
 
@@ -436,13 +375,12 @@ D4C-main/
 │   ├── AM_Movies/reviews.pickle
 │   ├── TripAdvisor/reviews.pickle
 │   └── Yelp/reviews.pickle
-├── checkpoints/          # 模型与反事实 CSV（paths_config.CHECKPOINT_DIR）
-├── sh/                   # run_step3_optimized.sh、run_step4_optimized.sh 等便捷脚本
-├── tmux-slurm/           # Slurm / tmux / nohup 辅助脚本
+├── runs/                 # 正式训练/评测产物根（task{T}/vN/...）
+├── legacy/               # 考古：legacy/code/、legacy/sh/、legacy/tools/
+├── scripts/entrypoints/  # 单阶段便捷编排（step3.sh 等）
 ├── code/
 │   ├── d4c.py
 │   ├── d4c_core/
-│   ├── legacy/           # 历史脚本（run_all.sh、train.py 等，不再推荐）
 │   ├── tools/            # 排障 / 比对小工具
 │   ├── paths_config.py
 │   └── ...

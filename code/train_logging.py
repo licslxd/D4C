@@ -10,13 +10,10 @@
   D4C_LOG_PRETTY=0  关闭多行缩进 JSON（默认开启 RUN_META / RUN_CONFIG 多行缩进，便于阅读）
   D4C_LOG_STRUCTURED_CONSOLE=1  结构化块（RUN_*）同时打到控制台；默认仅写入日志文件，避免与 FileHandler
                                 并存且 stderr 被 tee/重定向到同一文件时出现重复行。
-  D4C_EVAL_SUMMARY=0           关闭 eval 自动汇总（默认开启）：写入每任务与全局共 6 个文件（txt/jsonl/csv）。
-  D4C_EVAL_SUMMARY_GLOBAL_DIR  全局汇总目录（显式设置时优先，路径原样使用）。未设置时：优先按 D4C_LOG_GROUP
-                                为 <项目根>/log/<group>/eval；否则按 D4C_CHECKPOINT_GROUP；再否则按 SUBDIR 启发式
-                                （step3_/step5_ 前缀）；否则 <项目根>/log/eval。
-                                内含 eval_runs_all.{txt,jsonl,csv}
-  每任务 eval 汇总：get_log_task_dir(task) 下的 eval/ 子目录内 eval_runs.{txt,jsonl,csv}（训练主日志在 runs/ 子目录，由 shell 约定）
-  D4C_STEP3_ALL_SHELL_LOG  （仅 shell）run_step3_optimized.sh --all 前台 tee 汇总路径；未设置时默认为 log/step3_optimized_all_<秒级时间戳>.log
+  D4C_EVAL_SUMMARY=0           关闭 eval 自动汇总（默认开启）：任务级写入 runs/task{T}/vN/meta/eval_registry.*；跨任务全局仅写入 runs/global/vN/meta/eval_registry_all.*（见 path_layout 边界说明）。
+  D4C_ITERATION_META_DIR       由 d4c 注入，指向 runs/task{T}/vN/meta/；表头字段见 _EVAL_REGISTRY_CSV_FIELDS。
+  D4C_EVAL_SUMMARY_GLOBAL_DIR  可选；覆盖全局汇总目录（默认同 path_layout.get_global_meta_dir：仅 eval_registry_all.* 等跨任务元数据）。
+  D4C_STEP3_ALL_SHELL_LOG  （仅 shell）旧 Step3 批量脚本 --all 前台 tee 汇总路径；未设置时默认为 runs/global/vN/meta/shell_logs/step3_optimized_all_<秒级时间戳>.log
   D4C_LOG_SILENT_STDIO_WARN=1  关闭 setup_train_logging 对 stdout/stderr 与 --log_file 同路径的告警
   D4C_DUAL_TRAIN_LOG=1       双文件：--log_file 为 train.log（细粒度：Step/Grad/Checkpoint/Timing/数据告警），
                               另写同目录 nohup.log（RUN_*、epoch 块、DDP 心跳、性能汇总）。可用 D4C_SUMMARY_LOG 覆盖摘要路径。
@@ -32,9 +29,11 @@ import re
 import string
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
-from paths_config import get_d4c_root, get_log_task_dir
+from d4c_core import path_layout
+from paths_config import get_d4c_root
 
 LOGGER_NAME = "d4c"
 RUN_END_LINE = "========== RUN END =========="
@@ -404,10 +403,10 @@ def format_epoch_summary_lines(
     valid_loss_e_epoch: float,
     lr: float,
     quick_bleu4: Optional[float] = None,
-    full_bleu4: Optional[float] = None,
+    full_bleu_monitor_bleu4: Optional[float] = None,
     meteor: Optional[float] = None,
 ) -> str:
-    """紧凑 [Epoch Summary] 块（明文，便于 grep）。"""
+    """紧凑 [Epoch Summary] 块（明文，便于 grep）。full_bleu_monitor_bleu4 为训练期 full BLEU 监控分，非正式 eval。"""
     lines = [
         "[Epoch Summary]",
         f"epoch={epoch}",
@@ -423,8 +422,8 @@ def format_epoch_summary_lines(
     ]
     if quick_bleu4 is not None:
         lines.append(f"quick_bleu4={quick_bleu4:.6g}")
-    if full_bleu4 is not None:
-        lines.append(f"full_bleu4={full_bleu4:.6g}")
+    if full_bleu_monitor_bleu4 is not None:
+        lines.append(f"full_bleu_monitor_bleu4={full_bleu_monitor_bleu4:.6g}")
     if meteor is not None:
         lines.append(f"meteor={meteor:.6g}")
     return "\n".join(lines) + "\n\n"
@@ -627,6 +626,14 @@ def format_final_results_lines(
             f"{tab}METEOR: {final['explanation']['meteor']} ",
         ]
     )
+    pm = final.get("paper_metrics")
+    if isinstance(pm, dict) and pm.get("bleu"):
+        bl = pm["bleu"]
+        lines.append(
+            f"{tab}[paper_metrics] BLEU4(统一分词)={bl.get('4')} ROUGE-L={pm.get('rouge', {}).get('rouge_l_f')} "
+            f"DIST2={pm.get('distinct_corpus', {}).get('scale_percent_0_100', {}).get('2')} "
+            f"schema={pm.get('schema_version')}"
+        )
     if "bert" in final.get("explanation", {}):
         lines.append(f"{tab}BERT: {final['explanation']['bert']} ")
     lines.extend(format_eval_metrics_ext_lines(final))
@@ -769,18 +776,16 @@ def broadcast_run_paths_ddp(
     return obj[0], obj[1]
 
 
-# --- eval 结果自动汇总（每任务 + 全局，纯文本 / JSONL / CSV）---
+# --- eval 结果自动汇总（任务 runs/task{T}/vN/meta + 跨任务 runs/global/vN/meta；见 path_layout 边界）---
 
-_EVAL_SUMMARY_SUBDIR = "eval"  # 与 runs/…/train.log 分层：…/<group>/eval/eval_runs.*
+_EVAL_REGISTRY_TXT = "eval_registry.txt"
+_EVAL_REGISTRY_JSONL = "eval_registry.jsonl"
+_EVAL_REGISTRY_CSV = "eval_registry.csv"
+_EVAL_REGISTRY_GLOBAL_TXT = "eval_registry_all.txt"
+_EVAL_REGISTRY_GLOBAL_JSONL = "eval_registry_all.jsonl"
+_EVAL_REGISTRY_GLOBAL_CSV = "eval_registry_all.csv"
 
-_EVAL_SUMMARY_TXT = "eval_runs.txt"
-_EVAL_SUMMARY_JSONL = "eval_runs.jsonl"
-_EVAL_SUMMARY_CSV = "eval_runs.csv"
-_EVAL_SUMMARY_GLOBAL_TXT = "eval_runs_all.txt"
-_EVAL_SUMMARY_GLOBAL_JSONL = "eval_runs_all.jsonl"
-_EVAL_SUMMARY_GLOBAL_CSV = "eval_runs_all.csv"
-
-_EVAL_SUMMARY_CSV_FIELDS: Tuple[str, ...] = (
+_EVAL_REGISTRY_CSV_FIELDS: Tuple[str, ...] = (
     "ts",
     "run_id",
     "task_idx",
@@ -833,23 +838,17 @@ def _eval_summary_enabled() -> bool:
     return True
 
 
-def _global_eval_summary_dir() -> str:
+def _global_eval_registry_meta_dir() -> str:
+    """跨任务全局 eval 汇总目录（仅 ``eval_registry_all.*`` 等）；单任务注册表须写 ``runs/task{T}/vN/meta/``。
+
+    默认路径由 ``path_layout.get_global_meta_dir`` 给出；可用 ``D4C_EVAL_SUMMARY_GLOBAL_DIR`` 覆盖。
+    """
     g = os.environ.get("D4C_EVAL_SUMMARY_GLOBAL_DIR", "").strip()
     if g:
         return os.path.abspath(os.path.expanduser(g))
     _root = get_d4c_root()
-    log_group = os.environ.get("D4C_LOG_GROUP", "").strip().lower()
-    if log_group in ("step3", "step5"):
-        return os.path.join(_root, "log", log_group, _EVAL_SUMMARY_SUBDIR)
-    group = os.environ.get("D4C_CHECKPOINT_GROUP", "").strip().lower()
-    if group in ("step3", "step5"):
-        return os.path.join(_root, "log", group, _EVAL_SUMMARY_SUBDIR)
-    sub = os.environ.get("D4C_CHECKPOINT_SUBDIR", "").strip().lower()
-    if sub.startswith("step3_"):
-        return os.path.join(_root, "log", "step3", _EVAL_SUMMARY_SUBDIR)
-    if sub.startswith("step5_"):
-        return os.path.join(_root, "log", "step5", _EVAL_SUMMARY_SUBDIR)
-    return os.path.join(_root, "log", _EVAL_SUMMARY_SUBDIR)
+    it = os.environ.get("D4C_ITER", "v1").strip() or "v1"
+    return str(path_layout.get_global_meta_dir(Path(_root), it))
 
 
 def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, Any]:
@@ -932,10 +931,10 @@ def _append_csv_row(path: str, row: Dict[str, Any]) -> None:
         os.makedirs(d, exist_ok=True)
     need_header = not os.path.isfile(path) or os.path.getsize(path) == 0
     with open(path, "a", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(_EVAL_SUMMARY_CSV_FIELDS), extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=list(_EVAL_REGISTRY_CSV_FIELDS), extrasaction="ignore")
         if need_header:
             w.writeheader()
-        w.writerow({k: row.get(k, "") for k in _EVAL_SUMMARY_CSV_FIELDS})
+        w.writerow({k: row.get(k, "") for k in _EVAL_REGISTRY_CSV_FIELDS})
 
 
 def append_train_epoch_metrics_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
@@ -968,13 +967,11 @@ def append_eval_run_summaries(
     decode_cfg: Optional[Dict[str, Any]] = None,
     eval_export_tag: str = "",
 ) -> None:
-    """将一次 eval 的指标追加到每任务目录与全局目录下的 .txt / .jsonl / .csv（共 6 个文件）。
+    """将一次 eval 的指标追加到任务级 ``runs/task{T}/vN/meta/eval_registry.*``，并追加跨任务全局
+    ``runs/global/vN/meta/eval_registry_all.*``（目录可由 ``D4C_EVAL_SUMMARY_GLOBAL_DIR`` 覆盖；
+    语义同 ``path_layout`` 中 global vs task meta 边界）。
 
-    每任务：get_log_task_dir(task_idx)/eval/ 下 eval_runs.{txt,jsonl,csv}（如 log/<task>/step3/eval/、log/<task>/step5/eval/）
-    全局：D4C_EVAL_SUMMARY_GLOBAL_DIR（显式路径不自动加子目录），否则为 log/step3/eval、log/step5/eval
-          或 log/eval 下 eval_runs_all.{txt,jsonl,csv}
-
-    设 D4C_EVAL_SUMMARY=0 可关闭。失败时静默忽略，不影响主训练/评估流程。
+    设 D4C_EVAL_SUMMARY=0 可关闭。失败时静默忽略。
     """
     if not _eval_summary_enabled():
         return
@@ -1032,14 +1029,14 @@ def append_eval_run_summaries(
     )
 
     try:
-        task_eval_dir = os.path.join(get_log_task_dir(task_idx), _EVAL_SUMMARY_SUBDIR)
-        _append_text(os.path.join(task_eval_dir, _EVAL_SUMMARY_TXT), plain_sep)
-        _append_jsonl(os.path.join(task_eval_dir, _EVAL_SUMMARY_JSONL), row)
-        _append_csv_row(os.path.join(task_eval_dir, _EVAL_SUMMARY_CSV), row)
-
-        gdir = _global_eval_summary_dir()
-        _append_text(os.path.join(gdir, _EVAL_SUMMARY_GLOBAL_TXT), plain_sep)
-        _append_jsonl(os.path.join(gdir, _EVAL_SUMMARY_GLOBAL_JSONL), row)
-        _append_csv_row(os.path.join(gdir, _EVAL_SUMMARY_GLOBAL_CSV), row)
+        meta = os.environ.get("D4C_ITERATION_META_DIR", "").strip()
+        if meta:
+            _append_jsonl(os.path.join(meta, _EVAL_REGISTRY_JSONL), row)
+            _append_csv_row(os.path.join(meta, _EVAL_REGISTRY_CSV), row)
+            _append_text(os.path.join(meta, _EVAL_REGISTRY_TXT), plain_sep)
+        gdir = _global_eval_registry_meta_dir()
+        _append_jsonl(os.path.join(gdir, _EVAL_REGISTRY_GLOBAL_JSONL), row)
+        _append_csv_row(os.path.join(gdir, _EVAL_REGISTRY_GLOBAL_CSV), row)
+        _append_text(os.path.join(gdir, _EVAL_REGISTRY_GLOBAL_TXT), plain_sep)
     except Exception:
         pass
